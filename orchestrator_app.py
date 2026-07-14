@@ -5,11 +5,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import mssql_python
 import openai
 import requests
 from azure.ai.projects import AIProjectClient
-from azure.cosmos import CosmosClient
-from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from azure.identity import ClientSecretCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -77,22 +76,15 @@ _state_ready = False
 
 
 def _ensure_state() -> dict:
-    """Lazily initialize Cosmos + Foundry clients once per worker process.
+    """Lazily initialize the Foundry client once per worker process.
 
-    Azure Functions does not run FastAPI's lifespan, so client setup that used
-    to live in `lifespan` happens here on the first request and is cached in the
-    module-level `state` dict for the life of the worker.
+    Azure Functions does not run FastAPI's lifespan, so client setup happens on
+    the first request and is cached in the module-level `state` dict. (Azure SQL
+    connections are opened per-request via get_conn(), not cached here.)
     """
     global _state_ready
     if _state_ready:
         return state
-
-    cosmos = CosmosClient(
-        url=os.environ["COSMOS_ENDPOINT"],
-        credential=os.environ["COSMOS_KEY"],
-    )
-    db = cosmos.get_database_client("enterprise_memory")
-    sessions = db.get_container_client("user-conversations")
 
     credential = ClientSecretCredential(
         tenant_id=os.environ["AZURE_SP_TENANT_ID"],
@@ -105,13 +97,40 @@ def _ensure_state() -> dict:
     )
 
     state["openai_client"] = project_client.get_openai_client()
-    state["cosmos"] = cosmos
-    state["sessions"] = sessions
     state["project_client"] = project_client
 
     _state_ready = True
     logger.info("State initialized (lazy)")
     return state
+
+
+# ---------------------------------------------------------------------------
+# Azure SQL helpers
+# ---------------------------------------------------------------------------
+def get_conn():
+    """Open a fresh Azure SQL connection using SQL_CONNECTION_STRING.
+
+    A new connection per request keeps things thread-safe (FastAPI runs sync
+    endpoints on a threadpool). The driver pools connections under the hood.
+    """
+    conn_str = os.environ.get("SQL_CONNECTION_STRING")
+    if not conn_str:
+        logger.error("SQL_CONNECTION_STRING not configured")
+        raise HTTPException(status_code=500, detail="SQL not configured")
+    return mssql_python.connect(conn_str)
+
+
+def _fetchone_dict(cur) -> Optional[dict]:
+    row = cur.fetchone()
+    if row is None:
+        return None
+    cols = [c[0] for c in cur.description]
+    return dict(zip(cols, row))
+
+
+def _fetchall_dicts(cur) -> list:
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
 app = FastAPI(title="IT Support Orchestrator API")
@@ -358,15 +377,86 @@ def _final_turn(conv_id, user_message, vars, messages):
     return messages, DONE, vars
 
 
-def load_state(sessions, user_id: str, conv_id: str):
-    try:
-        return sessions.read_item(item=conv_id, partition_key=user_id)
-    except CosmosResourceNotFoundError:
+# ---------------------------------------------------------------------------
+# Persistence: conversations + sessions tables (Azure SQL)
+# ---------------------------------------------------------------------------
+def load_state(conn, user_id: str, conv_id: str):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, user_id, conversation_id, stage, vars, question, answer, "
+        "session_id, seq, previous_conversation_id, summary, title, rolled_over, "
+        "created_at, updated_at FROM conversations WHERE user_id = ? AND id = ?",
+        (user_id, conv_id),
+    )
+    row = _fetchone_dict(cur)
+    if row is None:
         return None
+    row["vars"] = json.loads(row["vars"]) if row.get("vars") else {}
+    return row
+
+
+def upsert_conversation(conn, item: dict) -> None:
+    vars_val = item.get("vars")
+    vars_json = (
+        json.dumps(vars_val, default=str)
+        if isinstance(vars_val, (dict, list))
+        else vars_val
+    )
+    rolled_over = 1 if item.get("rolled_over") else 0
+
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE conversations SET conversation_id = ?, stage = ?, vars = ?, "
+        "question = ?, answer = ?, session_id = ?, seq = ?, "
+        "previous_conversation_id = ?, summary = ?, title = ?, rolled_over = ?, "
+        "created_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+        (
+            item.get("conversation_id"),
+            item.get("stage"),
+            vars_json,
+            item.get("question"),
+            item.get("answer"),
+            item.get("session_id"),
+            item.get("seq"),
+            item.get("previous_conversation_id"),
+            item.get("summary"),
+            item.get("title"),
+            rolled_over,
+            item.get("created_at"),
+            item.get("updated_at"),
+            item.get("user_id"),
+            item.get("id"),
+        ),
+    )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO conversations (id, user_id, conversation_id, stage, vars, "
+            "question, answer, session_id, seq, previous_conversation_id, summary, "
+            "title, rolled_over, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item.get("id"),
+                item.get("user_id"),
+                item.get("conversation_id"),
+                item.get("stage"),
+                vars_json,
+                item.get("question"),
+                item.get("answer"),
+                item.get("session_id"),
+                item.get("seq"),
+                item.get("previous_conversation_id"),
+                item.get("summary"),
+                item.get("title"),
+                rolled_over,
+                item.get("created_at"),
+                item.get("updated_at"),
+            ),
+        )
+    conn.commit()
 
 
 def save_state(
-    sessions,
+    conn,
     user_id: str,
     conv_id: str,
     *,
@@ -380,10 +470,9 @@ def save_state(
     summary: Optional[str] = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    existing = load_state(sessions, user_id, conv_id) or {}
+    existing = load_state(conn, user_id, conv_id) or {}
     item = {
         "id": conv_id,
-        "type": "conversation",
         "user_id": user_id,
         "conversation_id": conv_id,
         "stage": stage,
@@ -400,6 +489,7 @@ def save_state(
             else existing.get("previous_conversation_id")
         ),
         "summary": summary if summary is not None else existing.get("summary"),
+        "rolled_over": existing.get("rolled_over"),
     }
     if not existing:
         item["title"] = question
@@ -407,24 +497,58 @@ def save_state(
     else:
         item["title"] = existing.get("title")
         item["created_at"] = existing.get("created_at", now)
-    sessions.upsert_item(item)
+    upsert_conversation(conn, item)
 
 
-def load_session(sessions, user_id: str, session_id: str):
-    try:
-        return sessions.read_item(item=session_id, partition_key=user_id)
-    except CosmosResourceNotFoundError:
-        return None
+def load_session(conn, user_id: str, session_id: str):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, session_id, user_id, current_conversation_id, title, "
+        "created_at, updated_at FROM sessions WHERE user_id = ? AND id = ?",
+        (user_id, session_id),
+    )
+    return _fetchone_dict(cur)
+
+
+def upsert_session(conn, item: dict) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE sessions SET session_id = ?, current_conversation_id = ?, "
+        "title = ?, created_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+        (
+            item.get("session_id"),
+            item.get("current_conversation_id"),
+            item.get("title"),
+            item.get("created_at"),
+            item.get("updated_at"),
+            item.get("user_id"),
+            item.get("id"),
+        ),
+    )
+    if cur.rowcount == 0:
+        cur.execute(
+            "INSERT INTO sessions (id, session_id, user_id, current_conversation_id, "
+            "title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                item.get("id"),
+                item.get("session_id"),
+                item.get("user_id"),
+                item.get("current_conversation_id"),
+                item.get("title"),
+                item.get("created_at"),
+                item.get("updated_at"),
+            ),
+        )
+    conn.commit()
 
 
 def save_session(
-    sessions, user_id: str, session_id: str, current_conversation_id: str, title: str
+    conn, user_id: str, session_id: str, current_conversation_id: str, title: str
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
-    existing = load_session(sessions, user_id, session_id) or {}
+    existing = load_session(conn, user_id, session_id) or {}
     item = {
         "id": session_id,
-        "type": "session",
         "session_id": session_id,
         "user_id": user_id,
         "current_conversation_id": current_conversation_id,
@@ -432,7 +556,7 @@ def save_session(
         "created_at": existing.get("created_at", now),
         "title": existing.get("title", title),
     }
-    sessions.upsert_item(item)
+    upsert_session(conn, item)
 
 
 @app.get("/")
@@ -442,14 +566,15 @@ def read_root():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
-    sessions = _ensure_state()["sessions"]
+    _ensure_state()
+    conn = get_conn()
     try:
         session_id = "sess_" + uuid.uuid4().hex
         conversation = create_conversation()
         messages, stage, vars = step(conversation.id, request.message, None, {})
         answer = "\n\n".join(m for m in messages if m)
         save_state(
-            sessions,
+            conn,
             request.user_id,
             conversation.id,
             stage=stage,
@@ -461,7 +586,7 @@ def chat(request: ChatRequest):
             previous_conversation_id=None,
         )
         save_session(
-            sessions, request.user_id, session_id, conversation.id, request.message
+            conn, request.user_id, session_id, conversation.id, request.message
         )
         return {
             "user_id": request.user_id,
@@ -477,11 +602,14 @@ def chat(request: ChatRequest):
     except Exception:
         logger.exception("chat failed user_id=%s", request.user_id)
         raise HTTPException(status_code=500, detail="Chat failed")
+    finally:
+        conn.close()
 
 
 @app.post("/chat/continue")
 def continue_chat(request: ContinueChatRequest):
-    sessions = _ensure_state()["sessions"]
+    _ensure_state()
+    conn = get_conn()
     try:
         session_id = request.session_id
 
@@ -490,12 +618,12 @@ def continue_chat(request: ContinueChatRequest):
                 status_code=422, detail="session_id or conversation_id is required"
             )
 
-        session = load_session(sessions, request.user_id, session_id)
+        session = load_session(conn, request.user_id, session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
         conv_id = session.get("current_conversation_id")
-        existing = load_state(sessions, request.user_id, conv_id)
+        existing = load_state(conn, request.user_id, conv_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -509,7 +637,7 @@ def continue_chat(request: ContinueChatRequest):
 
             existing["summary"] = summary
             existing["rolled_over"] = True
-            sessions.upsert_item(existing)
+            upsert_conversation(conn, existing)
 
             new_conv = create_conversation(seed_summary=summary)
             new_vars = {"carried_summary": summary} if summary else {}
@@ -519,7 +647,7 @@ def continue_chat(request: ContinueChatRequest):
             answer = "\n\n".join(m for m in messages if m)
 
             save_state(
-                sessions,
+                conn,
                 request.user_id,
                 new_conv.id,
                 stage=new_stage,
@@ -531,7 +659,7 @@ def continue_chat(request: ContinueChatRequest):
                 previous_conversation_id=conv_id,
             )
             save_session(
-                sessions,
+                conn,
                 request.user_id,
                 session_id,
                 new_conv.id,
@@ -545,7 +673,7 @@ def continue_chat(request: ContinueChatRequest):
             )
             answer = "\n\n".join(m for m in messages if m)
             save_state(
-                sessions,
+                conn,
                 request.user_id,
                 conv_id,
                 stage=new_stage,
@@ -568,49 +696,51 @@ def continue_chat(request: ContinueChatRequest):
     except Exception:
         logger.exception("continue_chat failed session_id=%s", request.session_id)
         raise HTTPException(status_code=500, detail="Chat failed")
+    finally:
+        conn.close()
 
 
 @app.get("/sessions/{user_id}")
 def get_sessions(user_id: str):
-    sessions = _ensure_state()["sessions"]
+    conn = get_conn()
     try:
-        rows = list(
-            sessions.query_items(
-                query=(
-                    "SELECT c.id, c.session_id, c.current_conversation_id, "
-                    "c.title, c.created_at, c.updated_at "
-                    "FROM c WHERE c.user_id=@user_id AND c.type = 'session' "
-                    "ORDER BY c.updated_at DESC OFFSET 0 LIMIT 20"
-                ),
-                parameters=[{"name": "@user_id", "value": user_id}],
-                partition_key=user_id,
-            )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 20 id, session_id, current_conversation_id, title, "
+            "created_at, updated_at FROM sessions WHERE user_id = ? "
+            "ORDER BY updated_at DESC",
+            (user_id,),
         )
+        rows = _fetchall_dicts(cur)
         return {"sessions": rows}
     except Exception:
         logger.exception("get_sessions failed user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to load sessions")
+    finally:
+        conn.close()
 
 
 @app.get("/conversations/{user_id}")
 def get_conversation(user_id: str):
-    sessions = _ensure_state()["sessions"]
+    conn = get_conn()
     try:
-        rows = list(
-            sessions.query_items(
-                query=(
-                    "SELECT * FROM c WHERE c.user_id=@user_id "
-                    "AND (NOT IS_DEFINED(c.type) OR c.type = 'conversation') "
-                    "ORDER BY c.created_at DESC OFFSET 0 LIMIT 10"
-                ),
-                parameters=[{"name": "@user_id", "value": user_id}],
-                partition_key=user_id,
-            )
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 10 id, user_id, conversation_id, stage, vars, question, "
+            "answer, session_id, seq, previous_conversation_id, summary, title, "
+            "rolled_over, created_at, updated_at FROM conversations "
+            "WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
         )
+        rows = _fetchall_dicts(cur)
+        for r in rows:
+            r["vars"] = json.loads(r["vars"]) if r.get("vars") else {}
         return {"conversations": rows}
     except Exception:
         logger.exception("get_conversation failed user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to load conversations")
+    finally:
+        conn.close()
 
 
 @app.get("/messages/{conversation_id}")
