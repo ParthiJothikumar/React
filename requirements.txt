@@ -1,0 +1,9 @@
+azure-functions
+fastapi
+pydantic
+openai
+requests
+azure-ai-projects
+azure-cosmos
+azure-identity
+python-dotenv

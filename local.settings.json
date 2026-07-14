@@ -1,0 +1,30 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+
+    "COSMOS_ENDPOINT": "",
+    "COSMOS_KEY": "",
+
+    "AZURE_SP_TENANT_ID": "",
+    "AZURE_SP_CLIENT_ID": "",
+    "AZURE_SP_CLIENT_SECRET": "",
+
+    "AZURE_FOUNDRY_PROJECT_ENDPOINT": "",
+
+    "SUMMARY_MODEL": "gpt-4.1-mini",
+    "ORCHESTRATOR_AGENT_URL": "",
+    "OUTLOOK_AGENT_URL": "",
+    "SERVICENOW_AGENT_URL": "",
+    "DIAGNOSTICS_AGENT_URL": "",
+    "TROUBLESHOOT_AGENT_URL": "",
+    "AGENT_RESPONSE_FIELD": "output",
+
+    "CORS_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173",
+    "LOG_LEVEL": "INFO"
+  },
+  "Host": {
+    "CORS": "*"
+  }
+}
