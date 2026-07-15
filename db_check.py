@@ -1,41 +1,36 @@
-"""Quick Azure SQL connection test using mssql-python.
+import sys
+print("start", flush=True)
 
-Reads SQL_CONNECTION_STRING from the environment or a local .env file,
-connects, runs a simple query, and checks that the app's tables exist.
+import pymssql
+print("pymssql imported, version:", pymssql.__version__, flush=True)
 
-Run:  python db_check.py
-"""
-import os
-
-from dotenv import load_dotenv
-import mssql_python
-
-load_dotenv()
-
-conn_str = "Server=tcp:ai-foundry-memory.database.windows.net,1433;Database=ai-foundry-memory-db;Uid=aifoundrymemory;Pwd=Safari@1234#;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
-if not conn_str:
-    raise SystemExit("SQL_CONNECTION_STRING is not set (check your .env / environment).")
-
-print("Connecting to Azure SQL...")
-try:
-    conn = mssql_python.connect(conn_str)
-except Exception as exc:
-    raise SystemExit(f"Connection FAILED: {exc}")
+SERVER   = "YOURSERVER.database.windows.net"   # or host\instance, or IP
+PORT     = 1433
+USER     = "YOURUSER"          # Azure SQL: try "user@YOURSERVER" if plain user fails
+PASSWORD = "YOURPASSWORD"
+DATABASE = "YOURDB"
 
 try:
-    cur = conn.cursor()
-
-    # 1. basic connectivity
-    cur.execute("SELECT @@VERSION")
-    print("Connected. Server:", cur.fetchone()[0].splitlines()[0])
-
-    # 2. do our tables exist?
-    cur.execute(
-        "SELECT name FROM sys.tables WHERE name IN ('conversations', 'sessions')"
+    print("connecting...", flush=True)
+    conn = pymssql.connect(
+        server=SERVER,
+        port=PORT,
+        user=USER,
+        password=PASSWORD,
+        database=DATABASE,
+        login_timeout=10,     # so it fails fast instead of hanging
+        timeout=10,
     )
-    tables = [r[0] for r in cur.fetchall()]
-    print("Tables found:", tables if tables else "(none - run schema.sql first)")
+    print("connected OK", flush=True)
 
-    print("OK - SQL connection works.")
-finally:
+    cur = conn.cursor()
+    cur.execute("SELECT @@VERSION")
+    print("result:", cur.fetchone(), flush=True)
+
+    cur.close()
     conn.close()
+    print("done", flush=True)
+
+except Exception as e:
+    print("FAILED:", type(e).__name__, e, flush=True)
+    sys.exit(1)
