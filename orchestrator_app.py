@@ -1,11 +1,11 @@
 import json
 import logging
 import os
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import mssql_python
 import openai
 import requests
 from azure.ai.projects import AIProjectClient
@@ -107,17 +107,34 @@ def _ensure_state() -> dict:
 # ---------------------------------------------------------------------------
 # Azure SQL helpers
 # ---------------------------------------------------------------------------
+# If SQLITE_DB_PATH is set, use a LOCAL SQLite file instead of Azure SQL.
+# Handy for testing on a machine that can't reach Azure SQL. Leave it empty to
+# use the real Azure SQL connection (SQL_CONNECTION_STRING).
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "")
+
+
 def get_conn():
-    """Open a fresh Azure SQL connection using SQL_CONNECTION_STRING.
+    """Open a DB connection (local SQLite, or Azure SQL).
+
+    When SQLITE_DB_PATH is set we open a local SQLite file (built into Python -
+    no install/network/driver needed), ideal for offline testing. Otherwise we
+    open Azure SQL via mssql_python + SQL_CONNECTION_STRING. Both are DB-API 2.0
+    with '?' placeholders, so every query below works unchanged on either.
 
     A new connection per request keeps things thread-safe (FastAPI runs sync
-    endpoints on a threadpool). The driver pools connections under the hood.
+    endpoints on a threadpool).
     """
+    if SQLITE_DB_PATH:
+        return sqlite3.connect(SQLITE_DB_PATH)
+
     conn_str = os.environ.get("SQL_CONNECTION_STRING")
     if not conn_str:
         logger.error("SQL_CONNECTION_STRING not configured")
         raise HTTPException(status_code=500, detail="SQL not configured")
-    return mssql_python.connect(conn_str)
+
+    #import mssql_python  # lazy: only needed for Azure SQL, so SQLite mode runs without it
+
+    #return mssql_python.connect(conn_str)
 
 
 def _fetchone_dict(cur) -> Optional[dict]:
@@ -705,12 +722,20 @@ def get_sessions(user_id: str):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT TOP 20 id, session_id, current_conversation_id, title, "
-            "created_at, updated_at FROM sessions WHERE user_id = ? "
-            "ORDER BY updated_at DESC",
-            (user_id,),
-        )
+        if SQLITE_DB_PATH:
+            cur.execute(
+                "SELECT id, session_id, current_conversation_id, title, "
+                "created_at, updated_at FROM sessions WHERE user_id = ? "
+                "ORDER BY updated_at DESC LIMIT 20",
+                (user_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT TOP 20 id, session_id, current_conversation_id, title, "
+                "created_at, updated_at FROM sessions WHERE user_id = ? "
+                "ORDER BY updated_at DESC",
+                (user_id,),
+            )
         rows = _fetchall_dicts(cur)
         return {"sessions": rows}
     except Exception:
@@ -725,13 +750,23 @@ def get_conversation(user_id: str):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT TOP 10 id, user_id, conversation_id, stage, vars, question, "
-            "answer, session_id, seq, previous_conversation_id, summary, title, "
-            "rolled_over, created_at, updated_at FROM conversations "
-            "WHERE user_id = ? ORDER BY created_at DESC",
-            (user_id,),
+        cols = (
+            "id, user_id, conversation_id, stage, vars, question, answer, "
+            "session_id, seq, previous_conversation_id, summary, title, "
+            "rolled_over, created_at, updated_at"
         )
+        if SQLITE_DB_PATH:
+            cur.execute(
+                f"SELECT {cols} FROM conversations WHERE user_id = ? "
+                "ORDER BY created_at DESC LIMIT 10",
+                (user_id,),
+            )
+        else:
+            cur.execute(
+                f"SELECT TOP 10 {cols} FROM conversations "
+                "WHERE user_id = ? ORDER BY created_at DESC",
+                (user_id,),
+            )
         rows = _fetchall_dicts(cur)
         for r in rows:
             r["vars"] = json.loads(r["vars"]) if r.get("vars") else {}
