@@ -41,8 +41,10 @@ SERVICENOW_AGENT = os.getenv("SERVICENOW_AGENT_URL", "")
 DIAGNOSTICS_AGENT = os.getenv("DIAGNOSTICS_AGENT_URL", "")
 TROUBLESHOOT_AGENT = os.getenv("TROUBLESHOOT_AGENT_URL", "")
 
-# Field in each agent Function App's JSON response that holds the reply text.
-AGENT_RESPONSE_FIELD = os.getenv("AGENT_RESPONSE_FIELD", "output")
+# Field in an agent's JSON response holding the human-readable text (used only
+# for agents whose reply is shown to the user). Structured agents (orchestrator/
+# outlook) are read as the FULL dict via run_agent_json().
+AGENT_RESPONSE_FIELD = os.getenv("AGENT_RESPONSE_FIELD", "message")
 # Max seconds to wait for an agent Function App to respond.
 AGENT_HTTP_TIMEOUT = int(os.getenv("AGENT_HTTP_TIMEOUT", "120"))
 
@@ -112,6 +114,23 @@ def _ensure_state() -> dict:
 # use the real Azure SQL connection (SQL_CONNECTION_STRING).
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "")
 
+# Schema for SQLite mode. On a Function App nobody runs setup_sqlite.py, so we
+# create the tables on first connect (idempotent) to avoid "no such table".
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT NOT NULL, user_id TEXT NOT NULL, conversation_id TEXT, stage TEXT,
+    vars TEXT, question TEXT, answer TEXT, session_id TEXT, seq INTEGER,
+    previous_conversation_id TEXT, summary TEXT, title TEXT, rolled_over INTEGER,
+    created_at TEXT, updated_at TEXT, PRIMARY KEY (user_id, id)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT NOT NULL, session_id TEXT, user_id TEXT NOT NULL,
+    current_conversation_id TEXT, title TEXT, created_at TEXT, updated_at TEXT,
+    PRIMARY KEY (user_id, id)
+);
+"""
+_sqlite_ready = False
+
 
 def get_conn():
     """Open a DB connection (local SQLite, or Azure SQL).
@@ -123,9 +142,19 @@ def get_conn():
 
     A new connection per request keeps things thread-safe (FastAPI runs sync
     endpoints on a threadpool).
+
+    NOTE: SQLite is for TESTING only. On a Function App the file lives on the
+    per-instance temp disk, so it is wiped on restart/scale and not shared
+    across instances. Use Azure SQL for anything that must persist.
     """
     if SQLITE_DB_PATH:
-        return sqlite3.connect(SQLITE_DB_PATH)
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        global _sqlite_ready
+        if not _sqlite_ready:
+            conn.executescript(_SQLITE_SCHEMA)
+            conn.commit()
+            _sqlite_ready = True
+        return conn
 
     conn_str = os.environ.get("SQL_CONNECTION_STRING")
     if not conn_str:
@@ -173,13 +202,11 @@ class ContinueChatRequest(BaseModel):
     conversation_id: Optional[str] = None  # backward-compat fallback
 
 
-def run_agent(conv_id: str, agent_url: str, message: str) -> str:
-    """Call an agent's own Function App over HTTP and return its reply text.
+def call_agent(conv_id: str, agent_url: str, message: str) -> dict:
+    """POST to an agent's Function App and return its FULL JSON response dict.
 
-    Each agent is a separate Function App. We POST a JSON body with the
-    conversation id (for continuity) and the message; the Function App runs
-    the agent internally and returns JSON. The reply text is read from the
-    field named by AGENT_RESPONSE_FIELD (default "output").
+    Each agent is a separate Function App. We send the conversation id (for
+    continuity) and the message; the agent runs internally and returns JSON.
     """
     if not agent_url:
         logger.error("agent url not configured")
@@ -192,43 +219,21 @@ def run_agent(conv_id: str, agent_url: str, message: str) -> str:
             timeout=AGENT_HTTP_TIMEOUT,
         )
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
     except requests.RequestException as exc:
         logger.error("agent call failed url=%s: %s", agent_url, exc)
         raise HTTPException(status_code=502, detail="Agent call failed")
 
-    output = data.get(AGENT_RESPONSE_FIELD)
-    if output is None:
-        logger.error(
-            "agent response missing '%s' field url=%s: %s",
-            AGENT_RESPONSE_FIELD,
-            agent_url,
-            data,
-        )
-        raise HTTPException(status_code=502, detail="Agent returned no output")
-    return output
+
+def run_agent_json(conv_id: str, agent_url: str, message: str) -> dict:
+    """Return the agent's FULL response dict (for structured agents)."""
+    return call_agent(conv_id, agent_url, message)
 
 
-def run_agent_json(conv_id: str, agent_name: str, message: str) -> dict:
-
-    text = run_agent(conv_id, agent_name, message)
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        cleaned = (
-            text.strip()
-            .removeprefix("```json")
-            .removeprefix("```")
-            .removesuffix("```")
-            .strip()
-        )
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            logger.error("agent %s returned non-JSON: %s", agent_name, text)
-            raise HTTPException(
-                status_code=502, detail=f"Agent {agent_name} returned invalid JSON"
-            )
+def run_agent(conv_id: str, agent_url: str, message: str) -> str:
+    """Return just the human-readable text (AGENT_RESPONSE_FIELD, default
+    'message') from the agent's response, for messages shown to the user."""
+    return call_agent(conv_id, agent_url, message).get(AGENT_RESPONSE_FIELD, "")
 
 
 def create_conversation(seed_summary: Optional[str] = None):
