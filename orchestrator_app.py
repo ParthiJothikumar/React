@@ -325,6 +325,33 @@ def translate_messages(messages: list, lang: str) -> list:
     return out
 
 
+def translate_to_english(text: str, lang: str) -> str:
+    """Translate an inbound user message into English (DEFAULT_LANG).
+
+    Lets the flow logic (the "yes"/"no" checks) and the sub-agents all operate in
+    one language regardless of what the user typed. No-op when the multilingual
+    agent isn't configured, the text is empty, or the user is already writing in
+    DEFAULT_LANG. Returns the original text on failure so a translation outage
+    never blocks the conversation.
+    """
+    if (
+        not MULTILINGUAL_AGENT
+        or not text
+        or not text.strip()
+        or not lang
+        or lang == DEFAULT_LANG
+    ):
+        return text
+    try:
+        resp = _post_multilingual(
+            {"action": "translate", "lang": DEFAULT_LANG, "message": text}
+        )
+        return resp.get("reply") or text
+    except Exception:
+        logger.exception("translate_to_english failed")
+        return text
+
+
 def create_conversation(seed_summary: Optional[str] = None):
     """Create a Foundry conversation, optionally seeded with prior-session context."""
     client = state["openai_client"]
@@ -406,6 +433,11 @@ def step(conv_id: str, user_message: str, stage, vars: dict):
     # Re-detect every turn so a mid-conversation language switch is honored; keep
     # the previously stored language when detection is empty/uncertain/unsupported.
     vars["lang"] = detect_language(user_message, fallback=vars.get("lang", ""))
+
+    # Work internally in English: translate the inbound message so the yes/no
+    # checks AND the sub-agents all see English, regardless of the user's language.
+    # (The endpoints still store request.message -- the original native text.)
+    user_message = translate_to_english(user_message, vars["lang"])
 
     if stage is None:
         return _start(conv_id, user_message, vars, messages)
