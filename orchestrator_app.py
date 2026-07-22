@@ -41,6 +41,23 @@ SERVICENOW_AGENT = os.getenv("SERVICENOW_AGENT_URL", "")
 DIAGNOSTICS_AGENT = os.getenv("DIAGNOSTICS_AGENT_URL", "")
 TROUBLESHOOT_AGENT = os.getenv("TROUBLESHOOT_AGENT_URL", "")
 
+# Multilingual agent (its own Function App): detects the user's language and
+# translates outgoing messages into it. It's a STATELESS utility -- it runs on
+# the Agents API (threads/runs) and creates its OWN thread per request, so we do
+# NOT pass a conversation id and it never touches our Foundry conversation.
+# Expected contract (structured JSON body):
+#   detect    -> {"action": "detect", "text": "<user msg>"}
+#                returns {"code": "fr", "supported": true, "confidence": 0.97, ...}
+#   translate -> {"action": "translate", "target": "fr", "text": "<english>"}
+#                returns {"translated": "<text in target language>"}
+MULTILINGUAL_AGENT = os.getenv("MULTILINGUAL_AGENT_URL", "")
+# Language assumed when detection is unavailable/uncertain/unsupported. Outgoing
+# messages are NOT translated when the detected language equals DEFAULT_LANG.
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
+# Below this detection confidence we keep the current language (avoids a short
+# reply like "ok" wrongly flipping the conversation's language).
+MIN_DETECT_CONFIDENCE = float(os.getenv("MIN_DETECT_CONFIDENCE", "0.55"))
+
 # Field in an agent's JSON response holding the human-readable text (used only
 # for agents whose reply is shown to the user). Structured agents (orchestrator/
 # outlook) are read as the FULL dict via run_agent_json().
@@ -161,9 +178,19 @@ def get_conn():
         logger.error("SQL_CONNECTION_STRING not configured")
         raise HTTPException(status_code=500, detail="SQL not configured")
 
-    #import mssql_python  # lazy: only needed for Azure SQL, so SQLite mode runs without it
+    # lazy import: only needed for Azure SQL, so SQLite mode runs without the
+    # driver installed. Add `mssql-python` to requirements.txt for deployment.
+    try:
+        import mssql_python
+    except ImportError:
+        logger.exception("mssql_python driver not installed")
+        raise HTTPException(status_code=500, detail="SQL driver not available")
 
-    #return mssql_python.connect(conn_str)
+    try:
+        return mssql_python.connect(conn_str)
+    except Exception:
+        logger.exception("Azure SQL connection failed")
+        raise HTTPException(status_code=503, detail="Database unavailable")
 
 
 def _fetchone_dict(cur) -> Optional[dict]:
@@ -234,6 +261,68 @@ def run_agent(conv_id: str, agent_url: str, message: str) -> str:
     """Return just the human-readable text (AGENT_RESPONSE_FIELD, default
     'message') from the agent's response, for messages shown to the user."""
     return call_agent(conv_id, agent_url, message).get(AGENT_RESPONSE_FIELD, "")
+
+
+def _post_multilingual(payload: dict) -> dict:
+    """POST a structured request to the multilingual Function App, return its JSON.
+
+    Uses its own request shape (not call_agent's {conversation_id, message}) because
+    the multilingual agent takes {action, text, target} and is stateless -- no
+    conversation id, no shared thread. Raises on transport error; callers catch.
+    """
+    resp = requests.post(MULTILINGUAL_AGENT, json=payload, timeout=AGENT_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def detect_language(text: str, fallback: str = "") -> str:
+    """Detect the user's language (ISO code) via the multilingual agent, every turn.
+
+    Keeps `fallback` (the previously detected language) -- or DEFAULT_LANG if none --
+    when the agent isn't configured, the text is empty, the language is unsupported,
+    detection is low-confidence, or the call fails. So a short reply like "ok" never
+    breaks the chat or wrongly flips the conversation language.
+    """
+    fb = fallback or DEFAULT_LANG
+    if not MULTILINGUAL_AGENT or not text or not text.strip():
+        return fb
+    try:
+        resp = _post_multilingual({"action": "detect", "text": text})
+        if not resp.get("supported"):
+            return fb  # unsupported language -> stay in the default language
+        if float(resp.get("confidence", 1)) < MIN_DETECT_CONFIDENCE:
+            return fb  # too uncertain -> keep the current language
+        return (resp.get("code") or fb).strip()
+    except Exception:
+        logger.exception("detect_language failed")
+        return fb
+
+
+def translate_messages(messages: list, lang: str) -> list:
+    """Translate each outgoing message into `lang` (ISO code) via the multilingual
+    agent, right before it goes to the frontend.
+
+    Per-message so the FE can still render each as its own bubble. No-ops (returns
+    the originals) when the agent isn't configured or lang == DEFAULT_LANG. A
+    per-message failure keeps that message's original text, so a translation outage
+    degrades gracefully instead of 502-ing the whole chat.
+    """
+    if not MULTILINGUAL_AGENT or not lang or lang == DEFAULT_LANG:
+        return messages
+    out = []
+    for m in messages:
+        if not m or not m.strip():
+            out.append(m)
+            continue
+        try:
+            resp = _post_multilingual(
+                {"action": "translate", "target": lang, "text": m}
+            )
+            out.append(resp.get("translated") or m)
+        except Exception:
+            logger.exception("translate failed")
+            out.append(m)
+    return out
 
 
 def create_conversation(seed_summary: Optional[str] = None):
@@ -307,8 +396,17 @@ def summarize_conversation(conv_id: str, vars: dict, prior_summary: str = "") ->
 
 
 def step(conv_id: str, user_message: str, stage, vars: dict):
+    """Advance the support flow by one turn based on the current stage.
 
+    Detects and stores the user's language, then dispatches to the handler for the
+    current stage. Returns (messages, new_stage, vars). Raises 409 if the stage is
+    already terminal (unknown/DONE).
+    """
     messages: list[str] = []
+    # Re-detect every turn so a mid-conversation language switch is honored; keep
+    # the previously stored language when detection is empty/uncertain/unsupported.
+    vars["lang"] = detect_language(user_message, fallback=vars.get("lang", ""))
+
     if stage is None:
         return _start(conv_id, user_message, vars, messages)
     if stage == AWAITING_OUTLOOK:
@@ -324,6 +422,11 @@ def step(conv_id: str, user_message: str, stage, vars: dict):
 
 
 def _start(conv_id, user_message, vars, messages):
+    """First turn: classify the issue via the orchestrator agent and route it.
+
+    Ends the flow for non-IT issues, hands non-Outlook IT issues to ServiceNow,
+    and otherwise continues into the Outlook flow.
+    """
     response = run_agent_json(conv_id, ORCHESTRATOR_AGENT, user_message)
     issue_type = response.get("issue_type")
     vars["issue_type"] = issue_type
@@ -340,6 +443,11 @@ def _start(conv_id, user_message, vars, messages):
 
 
 def _run_outlook(conv_id, user_message, vars, messages):
+    """Outlook-issue turn: query the Outlook agent and gather its reply.
+
+    Stays in AWAITING_OUTLOOK until the agent signals handoff; then delegates to
+    _post_handoff to branch into guidance or the diagnostics/ticketing path.
+    """
     outlook = run_agent_json(conv_id, OUTLOOK_AGENT, user_message)
     vars["outlook"] = outlook
 
@@ -353,6 +461,12 @@ def _run_outlook(conv_id, user_message, vars, messages):
 
 
 def _post_handoff(conv_id, outlook, vars, messages):
+    """After Outlook handoff, pick the next path.
+
+    If the agent gave self-service guidance, ask whether it resolved the issue
+    (AWAITING_RESOLVED). Otherwise raise a ServiceNow incident, run diagnostics,
+    and ask to proceed with troubleshooting (AWAITING_PROCEED).
+    """
     if outlook.get("guidance_troubleshoot"):
         messages.append("Did these steps resolve your issue?")
         return messages, AWAITING_RESOLVED, vars
@@ -371,6 +485,11 @@ def _post_handoff(conv_id, outlook, vars, messages):
 
 
 def _resolved_turn(conv_id, user_message, vars, messages):
+    """Handle the 'did the guidance resolve it?' answer.
+
+    'yes' closes the conversation; anything else falls back to ServiceNow. Flow
+    ends (DONE) either way.
+    """
     if "yes" in user_message.lower():
         messages.append("Glad it worked")
         return messages, DONE, vars
@@ -379,6 +498,11 @@ def _resolved_turn(conv_id, user_message, vars, messages):
 
 
 def _proceed_turn(conv_id, user_message, vars, messages):
+    """Handle the 'proceed with troubleshooting?' answer.
+
+    'yes' runs the Troubleshoot agent and asks whether the issue is resolved
+    (AWAITING_FINAL); anything else falls back to ServiceNow and ends (DONE).
+    """
     if "yes" in user_message.lower():
         messages.append("Troubleshoot started")
         outlook = vars.get("outlook", {})
@@ -392,6 +516,11 @@ def _proceed_turn(conv_id, user_message, vars, messages):
 
 
 def _final_turn(conv_id, user_message, vars, messages):
+    """Handle the final 'issue resolved?' answer after troubleshooting.
+
+    'yes' resolves the ServiceNow incident; anything else falls back to ServiceNow
+    (e.g. escalate/keep open). Flow ends (DONE) either way.
+    """
     if "yes" in user_message.lower():
         messages.append(run_agent(conv_id, SERVICENOW_AGENT, "action=resolve"))
         return messages, DONE, vars
@@ -586,6 +715,31 @@ def read_root():
     return {"message": "IT Support Orchestrator API"}
 
 
+FALLBACK_MESSAGE = (
+    "Sorry, something went wrong on our side and I couldn't process that just now. "
+    "Please try again in a moment."
+)
+
+
+def _fallback_chat_response(user_id, session_id=None, conversation_id=None):
+    """Safe chat payload returned when a turn fails unexpectedly.
+
+    Shaped like a normal /chat response so the frontend renders it as an assistant
+    bubble (with error=True) instead of choking on a raw HTTP 500. Client errors
+    (404/422) are still raised normally so the FE can handle them explicitly.
+    """
+    return {
+        "user_id": user_id,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+        "stage": "ERROR",
+        "done": True,
+        "error": True,
+        "messages": [FALLBACK_MESSAGE],
+        "answer": FALLBACK_MESSAGE,
+    }
+
+
 @app.post("/chat")
 def chat(request: ChatRequest):
     _ensure_state()
@@ -594,6 +748,7 @@ def chat(request: ChatRequest):
         session_id = "sess_" + uuid.uuid4().hex
         conversation = create_conversation()
         messages, stage, vars = step(conversation.id, request.message, None, {})
+        messages = translate_messages(messages, vars.get("lang"))
         answer = "\n\n".join(m for m in messages if m)
         save_state(
             conn,
@@ -619,11 +774,14 @@ def chat(request: ChatRequest):
             "messages": messages,
             "answer": answer,
         }
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        if exc.status_code < 500:
+            raise  # client errors (404/422) -> let the frontend handle them
+        logger.error("chat server error user_id=%s: %s", request.user_id, exc.detail)
+        return _fallback_chat_response(request.user_id)
     except Exception:
         logger.exception("chat failed user_id=%s", request.user_id)
-        raise HTTPException(status_code=500, detail="Chat failed")
+        return _fallback_chat_response(request.user_id)
     finally:
         conn.close()
 
@@ -645,27 +803,28 @@ def continue_chat(request: ContinueChatRequest):
             raise HTTPException(status_code=404, detail="Session not found")
 
         conv_id = session.get("current_conversation_id")
-        existing = load_state(conn, request.user_id, conv_id)
-        if existing is None:
+        conversation = load_state(conn, request.user_id, conv_id)
+        if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        stage = existing.get("stage", DONE)
-        vars = existing.get("vars", {})
+        stage = conversation.get("stage", DONE)
+        vars = conversation.get("vars", {})
 
         if stage == DONE:
             # --- ROLLOVER: cumulative summary -> new seeded conversation ---
             prior_summary = vars.get("carried_summary", "")
             summary = summarize_conversation(conv_id, vars, prior_summary=prior_summary)
 
-            existing["summary"] = summary
-            existing["rolled_over"] = True
-            upsert_conversation(conn, existing)
+            conversation["summary"] = summary
+            conversation["rolled_over"] = True
+            upsert_conversation(conn, conversation)
 
             new_conv = create_conversation(seed_summary=summary)
             new_vars = {"carried_summary": summary} if summary else {}
             messages, new_stage, new_vars = step(
                 new_conv.id, request.message, None, new_vars
             )
+            messages = translate_messages(messages, new_vars.get("lang"))
             answer = "\n\n".join(m for m in messages if m)
 
             save_state(
@@ -677,7 +836,7 @@ def continue_chat(request: ContinueChatRequest):
                 question=request.message,
                 answer=answer,
                 session_id=session_id,
-                seq=existing.get("seq", 0) + 1,
+                seq=conversation.get("seq", 0) + 1,
                 previous_conversation_id=conv_id,
             )
             save_session(
@@ -693,6 +852,7 @@ def continue_chat(request: ContinueChatRequest):
             messages, new_stage, new_vars = step(
                 conv_id, request.message, stage, vars
             )
+            messages = translate_messages(messages, new_vars.get("lang"))
             answer = "\n\n".join(m for m in messages if m)
             save_state(
                 conn,
@@ -713,11 +873,17 @@ def continue_chat(request: ContinueChatRequest):
             "messages": messages,
             "answer": answer,
         }
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+        if exc.status_code < 500:
+            raise  # client errors (404/422) -> let the frontend handle them
+        logger.error(
+            "continue_chat server error session_id=%s: %s",
+            request.session_id, exc.detail,
+        )
+        return _fallback_chat_response(request.user_id, session_id=request.session_id)
     except Exception:
         logger.exception("continue_chat failed session_id=%s", request.session_id)
-        raise HTTPException(status_code=500, detail="Chat failed")
+        return _fallback_chat_response(request.user_id, session_id=request.session_id)
     finally:
         conn.close()
 
@@ -750,17 +916,50 @@ def get_sessions(user_id: str):
         conn.close()
 
 
+def _conversation_messages(openai_client, conversation_id: str) -> list:
+    """Fetch the visible message turns for one Foundry conversation."""
+    items = openai_client.conversations.items.list(
+        conversation_id=conversation_id, order="asc"
+    )
+    result = []
+    for item in items:
+        if getattr(item, "type", None) != "message":
+            continue
+        text = ""
+        for part in item.content or []:
+            if getattr(part, "text", None):
+                text = part.text
+                break
+        if text.startswith(CONTEXT_MARKER):
+            continue  # hide seeded prior-session context
+        result.append({"role": str(item.role), "content": text})
+    return result
+
+
 @app.get("/conversations/{user_id}")
-def get_conversation(user_id: str):
+def get_conversation(user_id: str, session_id: Optional[str] = None):
+    """Return the user's conversations, each with its Foundry messages attached.
+
+    Pass ?session_id=... to get just one session's chain (ordered by seq); omit it
+    for the user's most recent conversations. SQL supplies the conv_ids; Foundry
+    supplies the messages inside each (one items.list per conversation).
+    """
+    openai_client = _ensure_state()["openai_client"]
     conn = get_conn()
     try:
         cur = conn.cursor()
         cols = (
-            "id, user_id, conversation_id, stage, vars, question, answer, "
-            "session_id, seq, previous_conversation_id, summary, title, "
-            "rolled_over, created_at, updated_at"
+            "id, conversation_id, stage, question, answer, session_id, seq, "
+            "title, created_at, updated_at"
         )
-        if SQLITE_DB_PATH:
+        # Step 1: get the conversation rows (conv_ids) from SQL
+        if session_id:
+            cur.execute(
+                f"SELECT {cols} FROM conversations WHERE user_id = ? AND session_id = ? "
+                "ORDER BY seq ASC",
+                (user_id, session_id),
+            )
+        elif SQLITE_DB_PATH:
             cur.execute(
                 f"SELECT {cols} FROM conversations WHERE user_id = ? "
                 "ORDER BY created_at DESC LIMIT 10",
@@ -773,39 +972,20 @@ def get_conversation(user_id: str):
                 (user_id,),
             )
         rows = _fetchall_dicts(cur)
-        for r in rows:
-            r["vars"] = json.loads(r["vars"]) if r.get("vars") else {}
-        return {"conversations": rows}
     except Exception:
         logger.exception("get_conversation failed user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to load conversations")
     finally:
         conn.close()
 
+    # Step 2: attach each conversation's messages from Foundry
+    for r in rows:
+        try:
+            r["messages"] = _conversation_messages(openai_client, r["conversation_id"])
+            r["messages_ok"] = True
+        except Exception:
+            logger.exception("load messages failed conv_id=%s", r.get("conversation_id"))
+            r["messages"] = []
+            r["messages_ok"] = False  # FE can flag "couldn't load this part"
 
-@app.get("/messages/{conversation_id}")
-def get_messages(conversation_id: str):
-    openai_client = _ensure_state()["openai_client"]
-    try:
-        items = openai_client.conversations.items.list(
-            conversation_id=conversation_id, order="asc"
-        )
-        result = []
-        for item in items:
-            if getattr(item, "type", None) != "message":
-                continue
-            text = ""
-            for part in item.content or []:
-                if getattr(part, "text", None):
-                    text = part.text
-                    break
-            if text.startswith(CONTEXT_MARKER):
-                continue  # hide the seeded prior-session context turn
-            result.append({"role": str(item.role), "content": text})
-    except openai.NotFoundError:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    except Exception:
-        logger.exception("get_messages failed conversation_id=%s", conversation_id)
-        raise HTTPException(status_code=500, detail="Failed to load messages")
-
-    return {"conversation_id": conversation_id, "messages": result}
+    return {"user_id": user_id, "session_id": session_id, "conversations": rows}
