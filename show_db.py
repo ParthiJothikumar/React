@@ -1,30 +1,19 @@
-"""Print all rows in the local SQLite DB.
+import os, sqlite3
 
-Run:  python show_db.py
-"""
-import os
-import sqlite3
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
-path = os.getenv("SQLITE_DB_PATH") or "local.db"
-print("DB file:", os.path.abspath(path))
-
-conn = sqlite3.connect(path)
-conn.row_factory = sqlite3.Row   # so rows print as dicts
+db = os.getenv("SQLITE_DB_PATH") or "orchestrator.db"   # <- your actual path
+conn = sqlite3.connect(db)
+conn.row_factory = sqlite3.Row
 cur = conn.cursor()
 
-for table in ("sessions", "conversations"):
-    print(f"\n===== {table} =====")
-    try:
-        rows = cur.execute(f"SELECT * FROM {table}").fetchall()
-    except sqlite3.OperationalError as exc:
-        print("  (can't read table:", exc, ")")
-        continue
-    print(f"  {len(rows)} row(s)")
-    for r in rows:
-        print("  -", dict(r))
+print("=== SESSIONS ===")
+for r in cur.execute("SELECT * FROM sessions ORDER BY updated_at DESC"):
+    print(dict(r))
+
+print("\n=== CONVERSATIONS ===")
+for r in cur.execute(
+    "SELECT session_id, seq, stage, question, answer, summary, vars "
+    "FROM conversations ORDER BY session_id, seq"
+):
+    print(dict(r))
 
 conn.close()
