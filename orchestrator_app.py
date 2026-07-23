@@ -36,7 +36,7 @@ CORS_ORIGINS = [
 # FUNCTION APP URL (run_agent POSTs to it) -- they are no longer agent names.
 # If an app uses a function key, put the full URL incl. ?code=<key> here.
 ORCHESTRATOR_AGENT = os.getenv("ORCHESTRATOR_AGENT_URL", "")
-OUTLOOK_AGENT = os.getenv("OUTLOOK_AGENT_URL", "")
+CLASSIFICATION_AGENT = os.getenv("CLASSIFICATION_AGENT_URL", "")
 SERVICENOW_AGENT = os.getenv("SERVICENOW_AGENT_URL", "")
 DIAGNOSTICS_AGENT = os.getenv("DIAGNOSTICS_AGENT_URL", "")
 TROUBLESHOOT_AGENT = os.getenv("TROUBLESHOOT_AGENT_URL", "")
@@ -54,14 +54,7 @@ MULTILINGUAL_AGENT = os.getenv("MULTILINGUAL_AGENT_URL", "")
 # Language assumed when detection is unavailable/uncertain/unsupported. Outgoing
 # messages are NOT translated when the detected language equals DEFAULT_LANG.
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
-# Below this detection confidence we keep the current language (avoids a short
-# reply like "ok" wrongly flipping the conversation's language).
-MIN_DETECT_CONFIDENCE = float(os.getenv("MIN_DETECT_CONFIDENCE", "0.55"))
 
-# Field in an agent's JSON response holding the human-readable text (used only
-# for agents whose reply is shown to the user). Structured agents (orchestrator/
-# outlook) are read as the FULL dict via run_agent_json().
-AGENT_RESPONSE_FIELD = os.getenv("AGENT_RESPONSE_FIELD", "message")
 # Max seconds to wait for an agent Function App to respond.
 AGENT_HTTP_TIMEOUT = int(os.getenv("AGENT_HTTP_TIMEOUT", "120"))
 
@@ -194,6 +187,12 @@ def get_conn():
 
 
 def _fetchone_dict(cur) -> Optional[dict]:
+    """Return the row as a {column_name: value} dict, or None if no row.
+
+    DB-API cursors hand back rows as plain tuples; we zip them with the column
+    names (from cur.description) so callers can use row["stage"] instead of
+    fragile positional indexing like row[3].
+    """
     row = cur.fetchone()
     if row is None:
         return None
@@ -202,6 +201,10 @@ def _fetchone_dict(cur) -> Optional[dict]:
 
 
 def _fetchall_dicts(cur) -> list:
+    """Return all rows as a list of {column_name: value} dicts (see _fetchone_dict).
+
+    Empty list when the query matched nothing.
+    """
     cols = [c[0] for c in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -226,7 +229,7 @@ class ContinueChatRequest(BaseModel):
     user_id: str
     message: str
     session_id: Optional[str] = None
-    conversation_id: Optional[str] = None  # backward-compat fallback
+    conversation_id: Optional[str] = None 
 
 
 def call_agent(conv_id: str, agent_url: str, message: str) -> dict:
@@ -245,6 +248,7 @@ def call_agent(conv_id: str, agent_url: str, message: str) -> dict:
             json={"conversation_id": conv_id, "message": message if message else " "},
             timeout=AGENT_HTTP_TIMEOUT,
         )
+        #resp.raise_for_status() is the line that looks at the status code and, if it's 4xx/5xx status, raises requests.HTTPError
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as exc:
@@ -258,9 +262,9 @@ def run_agent_json(conv_id: str, agent_url: str, message: str) -> dict:
 
 
 def run_agent(conv_id: str, agent_url: str, message: str) -> str:
-    """Return just the human-readable text (AGENT_RESPONSE_FIELD, default
+    """Return just the human-readable text (default
     'message') from the agent's response, for messages shown to the user."""
-    return call_agent(conv_id, agent_url, message).get(AGENT_RESPONSE_FIELD, "")
+    return call_agent(conv_id, agent_url, message)
 
 
 def _post_multilingual(payload: dict) -> dict:
@@ -287,11 +291,9 @@ def detect_language(text: str, fallback: str = "") -> str:
     if not MULTILINGUAL_AGENT or not text or not text.strip():
         return fb
     try:
-        resp = _post_multilingual({"action": "detect", "text": text})
+        resp = _post_multilingual({"agent": "detect", "message": text})
         if not resp.get("supported"):
             return fb  # unsupported language -> stay in the default language
-        if float(resp.get("confidence", 1)) < MIN_DETECT_CONFIDENCE:
-            return fb  # too uncertain -> keep the current language
         return (resp.get("code") or fb).strip()
     except Exception:
         logger.exception("detect_language failed")
@@ -316,9 +318,9 @@ def translate_messages(messages: list, lang: str) -> list:
             continue
         try:
             resp = _post_multilingual(
-                {"action": "translate", "target": lang, "text": m}
+                {"agent": "translate", "lang": lang, "message": m}
             )
-            out.append(resp.get("translated") or m)
+            out.append(resp.get("reply") or m)
         except Exception:
             logger.exception("translate failed")
             out.append(m)
@@ -344,7 +346,7 @@ def translate_to_english(text: str, lang: str) -> str:
         return text
     try:
         resp = _post_multilingual(
-            {"action": "translate", "lang": DEFAULT_LANG, "message": text}
+            {"agent": "translate", "lang": DEFAULT_LANG, "message": text}
         )
         return resp.get("reply") or text
     except Exception:
@@ -374,6 +376,12 @@ def create_conversation(seed_summary: Optional[str] = None):
 
 
 def conversation_transcript(conv_id: str) -> str:
+    """Return the conversation's message turns as a plain "role: text" transcript.
+
+    Reads the message items from the Foundry conversation (oldest first) and skips
+    the seeded prior-session context turn (CONTEXT_MARKER). Used as input to
+    summarize_conversation.
+    """
     items = state["openai_client"].conversations.items.list(
         conversation_id=conv_id, order="asc"
     )
@@ -480,7 +488,7 @@ def _run_outlook(conv_id, user_message, vars, messages):
     Stays in AWAITING_OUTLOOK until the agent signals handoff; then delegates to
     _post_handoff to branch into guidance or the diagnostics/ticketing path.
     """
-    outlook = run_agent_json(conv_id, OUTLOOK_AGENT, user_message)
+    outlook = run_agent_json(conv_id, CLASSIFICATION_AGENT, user_message)
     vars["outlook"] = outlook
 
     if outlook.get("message"):
@@ -563,7 +571,12 @@ def _final_turn(conv_id, user_message, vars, messages):
 # ---------------------------------------------------------------------------
 # Persistence: conversations + sessions tables (Azure SQL)
 # ---------------------------------------------------------------------------
-def load_state(conn, user_id: str, conv_id: str):
+def load_conversation(conn, user_id: str, conv_id: str):
+    """Load one conversation's saved state row, or None if it doesn't exist.
+
+    Returns a dict keyed by column name, with `vars` already parsed from its JSON
+    text back into a Python dict (empty dict when absent).
+    """
     cur = conn.cursor()
     cur.execute(
         "SELECT id, user_id, conversation_id, stage, vars, question, answer, "
@@ -579,6 +592,12 @@ def load_state(conn, user_id: str, conv_id: str):
 
 
 def upsert_conversation(conn, item: dict) -> None:
+    """Insert or update a conversation row (an "upsert").
+
+    Serializes `vars` to JSON and the `rolled_over` flag to 0/1, then tries an
+    UPDATE by primary key (user_id + id); if it matched no row (rowcount == 0),
+    INSERTs instead. One code path that works on both SQLite and Azure SQL.
+    """
     vars_val = item.get("vars")
     vars_json = (
         json.dumps(vars_val, default=str)
@@ -638,7 +657,7 @@ def upsert_conversation(conn, item: dict) -> None:
     conn.commit()
 
 
-def save_state(
+def save_conversation(
     conn,
     user_id: str,
     conv_id: str,
@@ -652,8 +671,15 @@ def save_state(
     previous_conversation_id: Optional[str] = None,
     summary: Optional[str] = None,
 ) -> None:
+    """Save a conversation turn: merge the given fields with any existing row.
+
+    Lineage fields (session_id, seq, previous_conversation_id, summary) fall back
+    to whatever is already stored when passed as None, so a normal turn need not
+    re-supply them. On first save it stamps created_at and title (= the question),
+    then delegates the actual write to upsert_conversation.
+    """
     now = datetime.now(timezone.utc).isoformat()
-    existing = load_state(conn, user_id, conv_id) or {}
+    existing = load_conversation(conn, user_id, conv_id) or {}
     item = {
         "id": conv_id,
         "user_id": user_id,
@@ -684,6 +710,8 @@ def save_state(
 
 
 def load_session(conn, user_id: str, session_id: str):
+    """Load one session row (by user_id + session_id) as a dict, or None if
+    not found."""
     cur = conn.cursor()
     cur.execute(
         "SELECT id, session_id, user_id, current_conversation_id, title, "
@@ -694,6 +722,8 @@ def load_session(conn, user_id: str, session_id: str):
 
 
 def upsert_session(conn, item: dict) -> None:
+    """Insert or update a session row -- same update-then-insert upsert as
+    upsert_conversation, but for the sessions table."""
     cur = conn.cursor()
     cur.execute(
         "UPDATE sessions SET session_id = ?, current_conversation_id = ?, "
@@ -728,6 +758,10 @@ def upsert_session(conn, item: dict) -> None:
 def save_session(
     conn, user_id: str, session_id: str, current_conversation_id: str, title: str
 ) -> None:
+    """Save/refresh a session: point it at the current conversation and bump
+    updated_at, preserving the original created_at and title. Delegates the write
+    to upsert_session.
+    """
     now = datetime.now(timezone.utc).isoformat()
     existing = load_session(conn, user_id, session_id) or {}
     item = {
@@ -744,6 +778,7 @@ def save_session(
 
 @app.get("/")
 def read_root():
+    """Health-check root endpoint; returns a static service banner."""
     return {"message": "IT Support Orchestrator API"}
 
 
@@ -774,6 +809,13 @@ def _fallback_chat_response(user_id, session_id=None, conversation_id=None):
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    """Start a new chat session and run the first turn.
+
+    Creates a fresh Foundry conversation and a new session id, runs step() for the
+    opening message, translates the reply into the user's language, then persists
+    the conversation and session rows. Returns the turn's messages + stage. On a
+    server-side failure returns a fallback message instead of a raw 500.
+    """
     _ensure_state()
     conn = get_conn()
     try:
@@ -782,7 +824,7 @@ def chat(request: ChatRequest):
         messages, stage, vars = step(conversation.id, request.message, None, {})
         messages = translate_messages(messages, vars.get("lang"))
         answer = "\n\n".join(m for m in messages if m)
-        save_state(
+        save_conversation(
             conn,
             request.user_id,
             conversation.id,
@@ -820,6 +862,14 @@ def chat(request: ChatRequest):
 
 @app.post("/chat/continue")
 def continue_chat(request: ContinueChatRequest):
+    """Continue an existing session by session_id.
+
+    Loads the session's current conversation. If it's already DONE, performs a
+    ROLLOVER: summarizes it, marks it rolled_over, and starts a new seeded
+    conversation for this message. Otherwise advances the in-flight conversation
+    by one turn. Translates outgoing messages, persists state, and returns a
+    fallback message on server-side failure.
+    """
     _ensure_state()
     conn = get_conn()
     try:
@@ -835,7 +885,7 @@ def continue_chat(request: ContinueChatRequest):
             raise HTTPException(status_code=404, detail="Session not found")
 
         conv_id = session.get("current_conversation_id")
-        conversation = load_state(conn, request.user_id, conv_id)
+        conversation = load_conversation(conn, request.user_id, conv_id)
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -859,7 +909,7 @@ def continue_chat(request: ContinueChatRequest):
             messages = translate_messages(messages, new_vars.get("lang"))
             answer = "\n\n".join(m for m in messages if m)
 
-            save_state(
+            save_conversation(
                 conn,
                 request.user_id,
                 new_conv.id,
@@ -886,7 +936,7 @@ def continue_chat(request: ContinueChatRequest):
             )
             messages = translate_messages(messages, new_vars.get("lang"))
             answer = "\n\n".join(m for m in messages if m)
-            save_state(
+            save_conversation(
                 conn,
                 request.user_id,
                 conv_id,
@@ -922,6 +972,11 @@ def continue_chat(request: ContinueChatRequest):
 
 @app.get("/sessions/{user_id}")
 def get_sessions(user_id: str):
+    """List a user's most recent sessions (up to 20), newest first.
+
+    Sidebar data: session id, current conversation, title, timestamps. Messages
+    are not included -- fetch those per session via /conversations/{user_id}.
+    """
     conn = get_conn()
     try:
         cur = conn.cursor()
