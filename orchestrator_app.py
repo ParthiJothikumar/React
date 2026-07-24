@@ -9,7 +9,7 @@ from typing import Optional
 import openai
 import requests
 from azure.ai.projects import AIProjectClient
-from azure.identity import ClientSecretCredential
+from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,7 +36,16 @@ CORS_ORIGINS = [
 # FUNCTION APP URL (run_agent POSTs to it) -- they are no longer agent names.
 # If an app uses a function key, put the full URL incl. ?code=<key> here.
 ORCHESTRATOR_AGENT = os.getenv("ORCHESTRATOR_AGENT_URL", "")
-CLASSIFICATION_AGENT = os.getenv("CLASSIFICATION_AGENT_URL", "")
+# Two-stage classification (each its own Function App):
+#   FIRST  -> classifies the issue and asks follow-ups. Response:
+#             follow-up: {"chat_close": false, "kb_id": null, "summary": null,
+#                         "agent_message": "<next question>"}
+#             done:      {"chat_close": true, "kb_id": "kb100",
+#                         "summary": "...", "agent_message": ""}
+#   SECOND -> given {summary, kb_id}, decides how to resolve. Response:
+#             {"mode": "manual" | "automate", "steps": "...", "agent_message": "..."}
+FIRST_CLASSIFICATION_AGENT = os.getenv("FIRST_CLASSIFICATION_AGENT_URL", "")
+SECOND_CLASSIFICATION_AGENT = os.getenv("SECOND_CLASSIFICATION_AGENT_URL", "")
 SERVICENOW_AGENT = os.getenv("SERVICENOW_AGENT_URL", "")
 DIAGNOSTICS_AGENT = os.getenv("DIAGNOSTICS_AGENT_URL", "")
 TROUBLESHOOT_AGENT = os.getenv("TROUBLESHOOT_AGENT_URL", "")
@@ -77,7 +86,7 @@ SUMMARY_INSTRUCTIONS = (
     "as a briefing for the next agent."
 )
 
-AWAITING_OUTLOOK = "AWAITING_OUTLOOK"
+AWAITING_CLASSIFY = "AWAITING_CLASSIFY"
 AWAITING_RESOLVED = "AWAITING_RESOLVED"
 AWAITING_PROCEED = "AWAITING_PROCEED"
 AWAITING_FINAL = "AWAITING_FINAL"
@@ -98,11 +107,7 @@ def _ensure_state() -> dict:
     if _state_ready:
         return state
 
-    credential = ClientSecretCredential(
-        tenant_id=os.environ["AZURE_SP_TENANT_ID"],
-        client_id=os.environ["AZURE_SP_CLIENT_ID"],
-        client_secret=os.environ["AZURE_SP_CLIENT_SECRET"],
-    )
+    credential = DefaultAzureCredential()
     project_client = AIProjectClient(
         credential=credential,
         endpoint=os.environ["AZURE_FOUNDRY_PROJECT_ENDPOINT"],
@@ -262,9 +267,36 @@ def run_agent_json(conv_id: str, agent_url: str, message: str) -> dict:
 
 
 def run_agent(conv_id: str, agent_url: str, message: str) -> str:
-    """Return just the human-readable text (default
-    'message') from the agent's response, for messages shown to the user."""
-    return call_agent(conv_id, agent_url, message)
+    """Return just the human-readable text from the agent's response.
+
+    Reads the first present of 'message' / 'reply' / 'agent_message' (empty string
+    if none), for replies shown to the user. Structured agents use run_agent_json.
+    """
+    resp = call_agent(conv_id, agent_url, message)
+    return resp.get("message") or resp.get("reply") or resp.get("agent_message") or ""
+
+
+def call_second_classification(conv_id: str, summary: str, kb_id) -> dict:
+    """Ask the SECOND classification agent how to resolve the issue.
+
+    Posts the first agent's {kb_id, summary} and returns its decision dict
+    {mode, steps, agent_message}. Raises HTTPException on failure (the endpoint
+    catches it and returns the fallback message).
+    """
+    if not SECOND_CLASSIFICATION_AGENT:
+        logger.error("second classification agent url not configured")
+        raise HTTPException(status_code=500, detail="Agent URL not configured")
+    try:
+        resp = requests.post(
+            SECOND_CLASSIFICATION_AGENT,
+            json={"conversation_id": conv_id, "kb_id": kb_id, "summary": summary},
+            timeout=AGENT_HTTP_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as exc:
+        logger.error("second classification call failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Agent call failed")
 
 
 def _post_multilingual(payload: dict) -> dict:
@@ -449,8 +481,8 @@ def step(conv_id: str, user_message: str, stage, vars: dict):
 
     if stage is None:
         return _start(conv_id, user_message, vars, messages)
-    if stage == AWAITING_OUTLOOK:
-        return _run_outlook(conv_id, user_message, vars, messages)
+    if stage == AWAITING_CLASSIFY:
+        return _run_classify(conv_id, user_message, vars, messages)
     if stage == AWAITING_RESOLVED:
         return _resolved_turn(conv_id, user_message, vars, messages)
     if stage == AWAITING_PROCEED:
@@ -465,7 +497,7 @@ def _start(conv_id, user_message, vars, messages):
     """First turn: classify the issue via the orchestrator agent and route it.
 
     Ends the flow for non-IT issues, hands non-Outlook IT issues to ServiceNow,
-    and otherwise continues into the Outlook flow.
+    and otherwise enters the classification flow (first classification agent).
     """
     response = run_agent_json(conv_id, ORCHESTRATOR_AGENT, user_message)
     issue_type = response.get("issue_type")
@@ -479,61 +511,93 @@ def _start(conv_id, user_message, vars, messages):
         messages.append(run_agent(conv_id, SERVICENOW_AGENT, ""))
         return messages, DONE, vars
 
-    return _run_outlook(conv_id, user_message, vars, messages)
+    return _run_classify(conv_id, user_message, vars, messages)
 
 
-def _run_outlook(conv_id, user_message, vars, messages):
-    """Outlook-issue turn: query the Outlook agent and gather its reply.
+def _run_classify(conv_id, user_message, vars, messages):
+    """First-classification turn: run the FIRST classification agent.
 
-    Stays in AWAITING_OUTLOOK until the agent signals handoff; then delegates to
-    _post_handoff to branch into guidance or the diagnostics/ticketing path.
+    While it needs more info it returns chat_close=false with a follow-up question
+    (agent_message); we show it and stay in AWAITING_CLASSIFY. When it returns
+    chat_close=true we store its kb_id + summary and hand off to the second
+    classification agent.
     """
-    outlook = run_agent_json(conv_id, CLASSIFICATION_AGENT, user_message)
-    vars["outlook"] = outlook
+    fc = run_agent_json(conv_id, FIRST_CLASSIFICATION_AGENT, user_message)
 
-    if outlook.get("message"):
-        messages.append(outlook["message"])
+    if not fc.get("chat_close"):
+        # still gathering info -> show the follow-up question and wait
+        if fc.get("agent_message"):
+            messages.append(fc["agent_message"])
+        return messages, AWAITING_CLASSIFY, vars
 
-    if not outlook.get("handoff"):
-        return messages, AWAITING_OUTLOOK, vars
+    # classification complete -> keep kb_id + summary for the second agent
+    vars["kb_id"] = fc.get("kb_id")
+    vars["kb_summary"] = fc.get("summary")
+    if fc.get("agent_message"):
+        messages.append(fc["agent_message"])
 
-    return _post_handoff(conv_id, outlook, vars, messages)
+    return _run_second_classification(conv_id, vars, messages)
 
 
-def _post_handoff(conv_id, outlook, vars, messages):
-    """After Outlook handoff, pick the next path.
+def _run_second_classification(conv_id, vars, messages):
+    """Second-classification decision: manual steps vs automated diagnostics.
 
-    If the agent gave self-service guidance, ask whether it resolved the issue
-    (AWAITING_RESOLVED). Otherwise raise a ServiceNow incident, run diagnostics,
-    and ask to proceed with troubleshooting (AWAITING_PROCEED).
+    Sends the first agent's summary + kb_id to the SECOND classification agent.
+    'manual' shows the steps and asks whether they resolved the issue
+    (AWAITING_RESOLVED). Otherwise ('automate') it raises a ServiceNow incident,
+    runs diagnostics, and asks to proceed with troubleshooting (AWAITING_PROCEED).
     """
-    if outlook.get("guidance_troubleshoot"):
+    sc = call_second_classification(conv_id, vars.get("kb_summary", ""), vars.get("kb_id"))
+    mode = (sc.get("mode") or "").lower()
+    vars["mode"] = mode
+
+    if mode == "manual":
+        if sc.get("steps"):
+            messages.append(sc["steps"])
+        if sc.get("agent_message"):
+            messages.append(sc["agent_message"])
         messages.append("Did these steps resolve your issue?")
         return messages, AWAITING_RESOLVED, vars
 
-    details = outlook.get("message", "")
+    # automate: create the incident first, then run diagnostics
+    details = vars.get("kb_summary", "")
+    issue_type = vars.get("issue_type", "outlook_it")
     snow = run_agent(
         conv_id,
         SERVICENOW_AGENT,
-        f"action=create_incident | issue_type=outlook_it | details={details}",
+        f"action=create_incident | issue_type={issue_type} | details={details}",
     )
     messages.append(snow)
     messages.append("Diagnosis Flow started")
-    messages.append(run_agent(conv_id, DIAGNOSTICS_AGENT, json.dumps(outlook)))
+    messages.append(
+        run_agent(
+            conv_id,
+            DIAGNOSTICS_AGENT,
+            json.dumps({"kb_id": vars.get("kb_id"), "summary": details}),
+        )
+    )
     messages.append("Proceed with troubleshooting?")
     return messages, AWAITING_PROCEED, vars
 
 
 def _resolved_turn(conv_id, user_message, vars, messages):
-    """Handle the 'did the guidance resolve it?' answer.
+    """Handle the 'did the manual steps resolve it?' answer (manual path).
 
-    'yes' closes the conversation; anything else falls back to ServiceNow. Flow
-    ends (DONE) either way.
+    'yes' closes the conversation. Otherwise we raise a ServiceNow incident with
+    the classification summary and end (DONE).
     """
     if "yes" in user_message.lower():
         messages.append("Glad it worked")
         return messages, DONE, vars
-    messages.append(run_agent(conv_id, SERVICENOW_AGENT, ""))
+    details = vars.get("kb_summary", "")
+    issue_type = vars.get("issue_type", "outlook_it")
+    messages.append(
+        run_agent(
+            conv_id,
+            SERVICENOW_AGENT,
+            f"action=create_incident | issue_type={issue_type} | details={details}",
+        )
+    )
     return messages, DONE, vars
 
 
@@ -545,9 +609,8 @@ def _proceed_turn(conv_id, user_message, vars, messages):
     """
     if "yes" in user_message.lower():
         messages.append("Troubleshoot started")
-        outlook = vars.get("outlook", {})
         messages.append(
-            run_agent(conv_id, TROUBLESHOOT_AGENT, outlook.get("message", ""))
+            run_agent(conv_id, TROUBLESHOOT_AGENT, vars.get("kb_summary", ""))
         )
         messages.append("Issue Resolved?")
         return messages, AWAITING_FINAL, vars
