@@ -1,6 +1,15 @@
-# React
-BGf8Q~jE7yVvR2hPWXoHSnpxBDE0g3R7..EOxasK
-
-3da18ff2-b91e-48d6-929a-ca3e496357cd
-
-ee899fee-b643-4305-b306-f879ac6240cc
+{
+    "name": "issue_classification",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "issue_type": {
+          "type": "string",
+          "enum": ["greeting", "non_it", "non_outlook_it", "outlook_it"]
+        }
+      },
+      "required": ["issue_type"],
+      "additionalProperties": false
+    }
+  }
