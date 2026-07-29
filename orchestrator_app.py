@@ -6,7 +6,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import openai
 import requests
 from azure.ai.projects import AIProjectClient
 from azure.identity import DefaultAzureCredential
@@ -55,10 +54,10 @@ TROUBLESHOOT_AGENT = os.getenv("TROUBLESHOOT_AGENT_URL", "")
 # the Agents API (threads/runs) and creates its OWN thread per request, so we do
 # NOT pass a conversation id and it never touches our Foundry conversation.
 # Expected contract (structured JSON body):
-#   detect    -> {"action": "detect", "text": "<user msg>"}
-#                returns {"code": "fr", "supported": true, "confidence": 0.97, ...}
-#   translate -> {"action": "translate", "target": "fr", "text": "<english>"}
-#                returns {"translated": "<text in target language>"}
+#   detect    -> {"agent": "detect", "message": "<text>"}
+#                returns {"code": "fr", "supported": true, ...}
+#   translate -> {"agent": "translate", "lang": "<target ISO>", "message": "<text>"}
+#                returns {"reply": "<text in target language>"}
 MULTILINGUAL_AGENT = os.getenv("MULTILINGUAL_AGENT_URL", "")
 # Language assumed when detection is unavailable/uncertain/unsupported. Outgoing
 # messages are NOT translated when the detected language equals DEFAULT_LANG.
@@ -67,30 +66,23 @@ DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
 # Max seconds to wait for an agent Function App to respond.
 AGENT_HTTP_TIMEOUT = int(os.getenv("AGENT_HTTP_TIMEOUT", "120"))
 
-# Model deployment used only to summarize a finished conversation for handoff.
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4.1-mini")
-
-# Prefix that marks the seeded context turn so it can be hidden from summaries/UI.
-CONTEXT_MARKER = "CONTEXT FROM THIS USER'S PREVIOUS"
-
-SUMMARY_INSTRUCTIONS = (
-    "You are maintaining a RUNNING briefing of a user's IT-support history so a fresh "
-    "agent can continue without losing context. You are given a summary of everything "
-    "BEFORE this conversation (may be empty), plus this conversation's transcript. Merge "
-    "them into a single updated briefing of 4-10 sentences, plain text (no markdown, no "
-    "bullet characters). Preserve the still-relevant facts from the earlier summary and "
-    "add what happened in this conversation: the issue(s) and environment details (app, "
-    "error text, device), what was diagnosed or attempted, outcomes (resolved or "
-    "ticket/incident IDs), and anything still open or likely to recur. Only use facts "
-    "present below; if a detail is unknown, omit it. Do not address the user; write it "
-    "as a briefing for the next agent."
-)
-
+AWAITING_ISSUE = "AWAITING_ISSUE"
 AWAITING_CLASSIFY = "AWAITING_CLASSIFY"
 AWAITING_RESOLVED = "AWAITING_RESOLVED"
 AWAITING_PROCEED = "AWAITING_PROCEED"
 AWAITING_FINAL = "AWAITING_FINAL"
 DONE = "DONE"
+
+# Non-actionable messages (greeting or general/non-IT): the orchestrator re-prompts
+# for an Outlook issue up to MAX_NONACTIONABLE times (shared counter), then ends the
+# conversation. No incident is created for these; the interaction (opened at the
+# start of every conversation) is closed when the conversation ends.
+MAX_NONACTIONABLE = int(os.getenv("MAX_NONACTIONABLE", "2"))
+GREETING_PROMPT = "Hi! How can I help you with your Outlook issue?"
+NON_IT_PROMPT = "This is Outlook IT support -- what Outlook issue can I help you with?"
+NONACTIONABLE_END_MESSAGE = (
+    "Thanks for contacting. For any Outlook support, please start a new conversation."
+)
 
 state: dict = {}
 _state_ready = False
@@ -135,8 +127,7 @@ _SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT NOT NULL, user_id TEXT NOT NULL, conversation_id TEXT, stage TEXT,
     vars TEXT, question TEXT, answer TEXT, session_id TEXT, seq INTEGER,
-    previous_conversation_id TEXT, summary TEXT, title TEXT, rolled_over INTEGER,
-    created_at TEXT, updated_at TEXT, PRIMARY KEY (user_id, id)
+    title TEXT, created_at TEXT, updated_at TEXT, PRIMARY KEY (user_id, id)
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT NOT NULL, session_id TEXT, user_id TEXT NOT NULL,
@@ -299,6 +290,69 @@ def call_second_classification(conv_id: str, summary: str, kb_id) -> dict:
         raise HTTPException(status_code=502, detail="Agent call failed")
 
 
+def snow_create_interaction(conv_id: str, user_id: str) -> str:
+    """Create a ServiceNow interaction for this conversation; return its id.
+
+    Best-effort: on failure we log and return "" so a ServiceNow hiccup at the
+    start of a conversation doesn't block the chat (incidents just won't be linked).
+    """
+    try:
+        resp = run_agent_json(
+            conv_id, SERVICENOW_AGENT, f"action=create_interaction | user={user_id}"
+        )
+        return resp.get("interaction_id", "") or ""
+    except Exception:
+        logger.exception("create_interaction failed")
+        return ""
+
+
+def snow_close_interaction(conv_id: str, interaction_id: str) -> None:
+    """Close the interaction (non-IT case). Best-effort; failure is logged only."""
+    try:
+        run_agent(
+            conv_id,
+            SERVICENOW_AGENT,
+            f"action=close_interaction | interaction_id={interaction_id}",
+        )
+    except Exception:
+        logger.exception("close_interaction failed")
+
+
+def snow_create_incident(conv_id: str, interaction_id, issue_type, details) -> dict:
+    """Create an incident UNDER the interaction; return the agent's JSON.
+
+    Passes interaction_id so the ServiceNow agent links the incident to the
+    interaction. Returns {incident_id, message, ...}. Raises on failure (the
+    endpoint catches it and shows the fallback) -- a failed incident is worth
+    surfacing, unlike the best-effort interaction create/close.
+    """
+    return run_agent_json(
+        conv_id,
+        SERVICENOW_AGENT,
+        f"action=create_incident | interaction_id={interaction_id} | "
+        f"issue_type={issue_type} | details={details}",
+    )
+
+
+def snow_update_incident(conv_id: str, incident_id, note: str) -> None:
+    """Add a progress update / work note to an existing incident. Best-effort.
+
+    Called at later stages (diagnostics, troubleshoot, or a user 'no') to record
+    progress on the incident opened at the start. Not shown to the user; a failed
+    update is logged but never blocks the flow. No-op when there's no incident_id.
+    """
+    if not incident_id:
+        return
+    try:
+        run_agent(
+            conv_id,
+            SERVICENOW_AGENT,
+            f"action=update_incident | incident_id={incident_id} | note={note}",
+        )
+    except Exception:
+        logger.exception("update_incident failed")
+
+
 def _post_multilingual(payload: dict) -> dict:
     """POST a structured request to the multilingual Function App, return its JSON.
 
@@ -386,80 +440,9 @@ def translate_to_english(text: str, lang: str) -> str:
         return text
 
 
-def create_conversation(seed_summary: Optional[str] = None):
-    """Create a Foundry conversation, optionally seeded with prior-session context."""
-    client = state["openai_client"]
-    if not seed_summary:
-        return client.conversations.create()
-
-    context_text = (
-        f"{CONTEXT_MARKER} SUPPORT HISTORY - background for the new request only, "
-        f"do not treat it as the current issue:\n{seed_summary}"
-    )
-    return client.conversations.create(
-        items=[
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": context_text}],
-            }
-        ]
-    )
-
-
-def conversation_transcript(conv_id: str) -> str:
-    """Return the conversation's message turns as a plain "role: text" transcript.
-
-    Reads the message items from the Foundry conversation (oldest first) and skips
-    the seeded prior-session context turn (CONTEXT_MARKER). Used as input to
-    summarize_conversation.
-    """
-    items = state["openai_client"].conversations.items.list(
-        conversation_id=conv_id, order="asc"
-    )
-    lines: list[str] = []
-    for item in items:
-        if getattr(item, "type", None) != "message":
-            continue
-        text = ""
-        for part in item.content or []:
-            if getattr(part, "text", None):
-                text = part.text
-                break
-        if text and not text.startswith(CONTEXT_MARKER):
-            lines.append(f"{item.role}: {text}")
-    return "\n".join(lines)
-
-
-def summarize_conversation(conv_id: str, vars: dict, prior_summary: str = "") -> str:
-    """Merge prior_summary with this conversation into one running briefing.
-
-    Returns a cumulative summary covering the whole session chain. On failure it
-    falls back to prior_summary so earlier context is never dropped.
-    """
-    try:
-        transcript = conversation_transcript(conv_id)
-        if not transcript.strip() and not prior_summary:
-            return ""
-        parts = [SUMMARY_INSTRUCTIONS]
-        if prior_summary:
-            parts.append(
-                "\n\n=== Summary of everything BEFORE this conversation ===\n"
-                + prior_summary
-            )
-        parts.append(
-            "\n\n=== Structured state (JSON) ===\n"
-            + json.dumps(vars, default=str)[:4000]
-        )
-        parts.append("\n\n=== This conversation transcript ===\n" + transcript)
-        resp = state["openai_client"].responses.create(
-            model=SUMMARY_MODEL,
-            input="".join(parts),
-        )
-        return (resp.output_text or "").strip() or prior_summary
-    except Exception:
-        logger.exception("summarize_conversation failed conv_id=%s", conv_id)
-        return prior_summary  # keep earlier context instead of dropping it
+def create_conversation():
+    """Create a new, empty Foundry conversation."""
+    return state["openai_client"].conversations.create()
 
 
 def step(conv_id: str, user_message: str, stage, vars: dict):
@@ -479,38 +462,81 @@ def step(conv_id: str, user_message: str, stage, vars: dict):
     # (The endpoints still store request.message -- the original native text.)
     user_message = translate_to_english(user_message, vars["lang"])
 
-    if stage is None:
-        return _start(conv_id, user_message, vars, messages)
-    if stage == AWAITING_CLASSIFY:
-        return _run_classify(conv_id, user_message, vars, messages)
-    if stage == AWAITING_RESOLVED:
-        return _resolved_turn(conv_id, user_message, vars, messages)
-    if stage == AWAITING_PROCEED:
-        return _proceed_turn(conv_id, user_message, vars, messages)
-    if stage == AWAITING_FINAL:
-        return _final_turn(conv_id, user_message, vars, messages)
+    if stage is None or stage == AWAITING_ISSUE:
+        result = _start(conv_id, user_message, vars, messages)
+    elif stage == AWAITING_CLASSIFY:
+        result = _run_classify(conv_id, user_message, vars, messages)
+    elif stage == AWAITING_RESOLVED:
+        result = _resolved_turn(conv_id, user_message, vars, messages)
+    elif stage == AWAITING_PROCEED:
+        result = _proceed_turn(conv_id, user_message, vars, messages)
+    elif stage == AWAITING_FINAL:
+        result = _final_turn(conv_id, user_message, vars, messages)
+    else:
+        raise HTTPException(status_code=409, detail="Conversation already completed")
 
-    raise HTTPException(status_code=409, detail="Conversation already completed")
+    messages, new_stage, vars = result
+    # The interaction represents the chat contact -> close it once the conversation
+    # ends (any terminal), whether or not an incident was created/resolved.
+    if (
+        new_stage == DONE
+        and vars.get("interaction_id")
+        and not vars.get("interaction_closed")
+    ):
+        snow_close_interaction(conv_id, vars["interaction_id"])
+        vars["interaction_closed"] = True
+    return messages, new_stage, vars
 
 
 def _start(conv_id, user_message, vars, messages):
-    """First turn: classify the issue via the orchestrator agent and route it.
+    """First turn / greeting loop: open the interaction, classify, and route.
 
-    Ends the flow for non-IT issues, hands non-Outlook IT issues to ServiceNow,
-    and otherwise enters the classification flow (first classification agent).
+    The ServiceNow interaction is opened ONCE, at the start of the conversation
+    (any category), and reused on greeting-loop turns. Routing by issue_type:
+      greeting / non_it -> re-prompt for an Outlook issue up to MAX_NONACTIONABLE
+                           times (shared counter), then end. No incident.
+      non_outlook_it    -> create an incident (ticket), thank the user, end.
+      outlook_it        -> create an incident up front, then enter classification.
+    The interaction is closed centrally in step() when the conversation ends.
     """
+    # Interaction is created once per conversation, at the start (reused on loops).
+    if not vars.get("interaction_id"):
+        vars["interaction_id"] = snow_create_interaction(
+            conv_id, vars.get("user_id", "")
+        )
+    interaction_id = vars["interaction_id"]
+
     response = run_agent_json(conv_id, ORCHESTRATOR_AGENT, user_message)
     issue_type = response.get("issue_type")
     vars["issue_type"] = issue_type
 
-    if issue_type == "non_it":
-        messages.append("This is an IT support agent only.")
-        return messages, DONE, vars
+    # Non-actionable (greeting or general/non-IT): re-prompt up to the cap, then end.
+    if issue_type in ("greeting", "non_it"):
+        count = vars.get("nonactionable_count", 0) + 1
+        vars["nonactionable_count"] = count
+        if count > MAX_NONACTIONABLE:
+            messages.append(NONACTIONABLE_END_MESSAGE)
+            return messages, DONE, vars
+        messages.append(GREETING_PROMPT if issue_type == "greeting" else NON_IT_PROMPT)
+        return messages, AWAITING_ISSUE, vars
 
+    # non_outlook_it: create the ticket under the interaction, thank the user, end.
     if issue_type == "non_outlook_it":
-        messages.append(run_agent(conv_id, SERVICENOW_AGENT, ""))
+        snow = snow_create_incident(conv_id, interaction_id, issue_type, user_message)
+        vars["incident_id"] = snow.get("incident_id")
+        ticket_msg = (
+            snow.get("message")
+            or f"Your ticket {snow.get('incident_id')} has been created."
+        )
+        messages.append(ticket_msg + " Thank you for contacting us.")
         return messages, DONE, vars
 
+    # outlook_it: create the incident up front, then enter the classification flow.
+    snow = snow_create_incident(conv_id, interaction_id, issue_type, user_message)
+    vars["incident_id"] = snow.get("incident_id")
+    messages.append(
+        snow.get("message") or f"Incident {snow.get('incident_id')} has been created."
+    )
     return _run_classify(conv_id, user_message, vars, messages)
 
 
@@ -544,8 +570,8 @@ def _run_second_classification(conv_id, vars, messages):
 
     Sends the first agent's summary + kb_id to the SECOND classification agent.
     'manual' shows the steps and asks whether they resolved the issue
-    (AWAITING_RESOLVED). Otherwise ('automate') it raises a ServiceNow incident,
-    runs diagnostics, and asks to proceed with troubleshooting (AWAITING_PROCEED).
+    (AWAITING_RESOLVED). Otherwise ('automate') it updates the incident (opened at
+    the start), runs diagnostics, and asks to proceed (AWAITING_PROCEED).
     """
     sc = call_second_classification(conv_id, vars.get("kb_summary", ""), vars.get("kb_id"))
     mode = (sc.get("mode") or "").lower()
@@ -559,15 +585,11 @@ def _run_second_classification(conv_id, vars, messages):
         messages.append("Did these steps resolve your issue?")
         return messages, AWAITING_RESOLVED, vars
 
-    # automate: create the incident first, then run diagnostics
+    # automate: the incident was opened at the start -> UPDATE it (reached diagnostics)
     details = vars.get("kb_summary", "")
-    issue_type = vars.get("issue_type", "outlook_it")
-    snow = run_agent(
-        conv_id,
-        SERVICENOW_AGENT,
-        f"action=create_incident | issue_type={issue_type} | details={details}",
+    snow_update_incident(
+        conv_id, vars.get("incident_id"), "Automated diagnostics started."
     )
-    messages.append(snow)
     messages.append("Diagnosis Flow started")
     messages.append(
         run_agent(
@@ -583,20 +605,26 @@ def _run_second_classification(conv_id, vars, messages):
 def _resolved_turn(conv_id, user_message, vars, messages):
     """Handle the 'did the manual steps resolve it?' answer (manual path).
 
-    'yes' closes the conversation. Otherwise we raise a ServiceNow incident with
-    the classification summary and end (DONE).
+    'yes' resolves the incident opened at the start. 'no' updates that incident
+    (it stays open for the team). Flow ends (DONE) either way.
     """
     if "yes" in user_message.lower():
+        messages.append(
+            run_agent(
+                conv_id,
+                SERVICENOW_AGENT,
+                f"action=resolve | interaction_id={vars.get('interaction_id', '')} | "
+                f"incident_id={vars.get('incident_id', '')}",
+            )
+        )
         messages.append("Glad it worked")
         return messages, DONE, vars
-    details = vars.get("kb_summary", "")
-    issue_type = vars.get("issue_type", "outlook_it")
+    # user said no -> update the incident, which stays open
+    snow_update_incident(
+        conv_id, vars.get("incident_id"), "Manual steps did not resolve the issue."
+    )
     messages.append(
-        run_agent(
-            conv_id,
-            SERVICENOW_AGENT,
-            f"action=create_incident | issue_type={issue_type} | details={details}",
-        )
+        f"Your incident {vars.get('incident_id', '')} stays open for the support team."
     )
     return messages, DONE, vars
 
@@ -608,13 +636,20 @@ def _proceed_turn(conv_id, user_message, vars, messages):
     (AWAITING_FINAL); anything else falls back to ServiceNow and ends (DONE).
     """
     if "yes" in user_message.lower():
+        # reached troubleshoot -> update the incident, then run troubleshoot
+        snow_update_incident(conv_id, vars.get("incident_id"), "Troubleshooting started.")
         messages.append("Troubleshoot started")
         messages.append(
             run_agent(conv_id, TROUBLESHOOT_AGENT, vars.get("kb_summary", ""))
         )
         messages.append("Issue Resolved?")
         return messages, AWAITING_FINAL, vars
-    messages.append(run_agent(conv_id, SERVICENOW_AGENT, ""))
+    # user said no -> update the incident, which stays open
+    snow_update_incident(conv_id, vars.get("incident_id"), "User declined troubleshooting.")
+    messages.append(
+        f"No problem. Your incident {vars.get('incident_id', '')} stays open for the "
+        "support team."
+    )
     return messages, DONE, vars
 
 
@@ -625,9 +660,22 @@ def _final_turn(conv_id, user_message, vars, messages):
     (e.g. escalate/keep open). Flow ends (DONE) either way.
     """
     if "yes" in user_message.lower():
-        messages.append(run_agent(conv_id, SERVICENOW_AGENT, "action=resolve"))
+        messages.append(
+            run_agent(
+                conv_id,
+                SERVICENOW_AGENT,
+                f"action=resolve | interaction_id={vars.get('interaction_id', '')} | "
+                f"incident_id={vars.get('incident_id', '')}",
+            )
+        )
         return messages, DONE, vars
-    messages.append(run_agent(conv_id, SERVICENOW_AGENT, ""))
+    # user said no -> update the incident, which stays open
+    snow_update_incident(
+        conv_id, vars.get("incident_id"), "Issue not resolved after troubleshooting."
+    )
+    messages.append(
+        f"Your incident {vars.get('incident_id', '')} stays open for the support team."
+    )
     return messages, DONE, vars
 
 
@@ -643,8 +691,8 @@ def load_conversation(conn, user_id: str, conv_id: str):
     cur = conn.cursor()
     cur.execute(
         "SELECT id, user_id, conversation_id, stage, vars, question, answer, "
-        "session_id, seq, previous_conversation_id, summary, title, rolled_over, "
-        "created_at, updated_at FROM conversations WHERE user_id = ? AND id = ?",
+        "session_id, seq, title, created_at, updated_at "
+        "FROM conversations WHERE user_id = ? AND id = ?",
         (user_id, conv_id),
     )
     row = _fetchone_dict(cur)
@@ -657,9 +705,9 @@ def load_conversation(conn, user_id: str, conv_id: str):
 def upsert_conversation(conn, item: dict) -> None:
     """Insert or update a conversation row (an "upsert").
 
-    Serializes `vars` to JSON and the `rolled_over` flag to 0/1, then tries an
-    UPDATE by primary key (user_id + id); if it matched no row (rowcount == 0),
-    INSERTs instead. One code path that works on both SQLite and Azure SQL.
+    Serializes `vars` to JSON, then tries an UPDATE by primary key (user_id + id);
+    if it matched no row (rowcount == 0), INSERTs instead. One code path that works
+    on both SQLite and Azure SQL.
     """
     vars_val = item.get("vars")
     vars_json = (
@@ -667,14 +715,12 @@ def upsert_conversation(conn, item: dict) -> None:
         if isinstance(vars_val, (dict, list))
         else vars_val
     )
-    rolled_over = 1 if item.get("rolled_over") else 0
 
     cur = conn.cursor()
     cur.execute(
         "UPDATE conversations SET conversation_id = ?, stage = ?, vars = ?, "
         "question = ?, answer = ?, session_id = ?, seq = ?, "
-        "previous_conversation_id = ?, summary = ?, title = ?, rolled_over = ?, "
-        "created_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+        "title = ?, created_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
         (
             item.get("conversation_id"),
             item.get("stage"),
@@ -683,10 +729,7 @@ def upsert_conversation(conn, item: dict) -> None:
             item.get("answer"),
             item.get("session_id"),
             item.get("seq"),
-            item.get("previous_conversation_id"),
-            item.get("summary"),
             item.get("title"),
-            rolled_over,
             item.get("created_at"),
             item.get("updated_at"),
             item.get("user_id"),
@@ -696,9 +739,8 @@ def upsert_conversation(conn, item: dict) -> None:
     if cur.rowcount == 0:
         cur.execute(
             "INSERT INTO conversations (id, user_id, conversation_id, stage, vars, "
-            "question, answer, session_id, seq, previous_conversation_id, summary, "
-            "title, rolled_over, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "question, answer, session_id, seq, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 item.get("id"),
                 item.get("user_id"),
@@ -709,10 +751,7 @@ def upsert_conversation(conn, item: dict) -> None:
                 item.get("answer"),
                 item.get("session_id"),
                 item.get("seq"),
-                item.get("previous_conversation_id"),
-                item.get("summary"),
                 item.get("title"),
-                rolled_over,
                 item.get("created_at"),
                 item.get("updated_at"),
             ),
@@ -731,15 +770,13 @@ def save_conversation(
     answer: str,
     session_id: Optional[str] = None,
     seq: Optional[int] = None,
-    previous_conversation_id: Optional[str] = None,
-    summary: Optional[str] = None,
 ) -> None:
     """Save a conversation turn: merge the given fields with any existing row.
 
-    Lineage fields (session_id, seq, previous_conversation_id, summary) fall back
-    to whatever is already stored when passed as None, so a normal turn need not
-    re-supply them. On first save it stamps created_at and title (= the question),
-    then delegates the actual write to upsert_conversation.
+    Lineage fields (session_id, seq) fall back to whatever is already stored when
+    passed as None, so a normal turn need not re-supply them. On first save it
+    stamps created_at and title (= the question), then delegates the actual write
+    to upsert_conversation.
     """
     now = datetime.now(timezone.utc).isoformat()
     existing = load_conversation(conn, user_id, conv_id) or {}
@@ -755,13 +792,6 @@ def save_conversation(
         # lineage: use the passed value, else keep what's already stored
         "session_id": session_id if session_id is not None else existing.get("session_id"),
         "seq": seq if seq is not None else existing.get("seq", 0),
-        "previous_conversation_id": (
-            previous_conversation_id
-            if previous_conversation_id is not None
-            else existing.get("previous_conversation_id")
-        ),
-        "summary": summary if summary is not None else existing.get("summary"),
-        "rolled_over": existing.get("rolled_over"),
     }
     if not existing:
         item["title"] = question
@@ -884,7 +914,9 @@ def chat(request: ChatRequest):
     try:
         session_id = "sess_" + uuid.uuid4().hex
         conversation = create_conversation()
-        messages, stage, vars = step(conversation.id, request.message, None, {})
+        messages, stage, vars = step(
+            conversation.id, request.message, None, {"user_id": request.user_id}
+        )
         messages = translate_messages(messages, vars.get("lang"))
         answer = "\n\n".join(m for m in messages if m)
         save_conversation(
@@ -897,7 +929,6 @@ def chat(request: ChatRequest):
             answer=answer,
             session_id=session_id,
             seq=0,
-            previous_conversation_id=None,
         )
         save_session(
             conn, request.user_id, session_id, conversation.id, request.message
@@ -925,13 +956,13 @@ def chat(request: ChatRequest):
 
 @app.post("/chat/continue")
 def continue_chat(request: ContinueChatRequest):
-    """Continue an existing session by session_id.
+    """Continue an ACTIVE conversation in a session by session_id.
 
-    Loads the session's current conversation. If it's already DONE, performs a
-    ROLLOVER: summarizes it, marks it rolled_over, and starts a new seeded
-    conversation for this message. Otherwise advances the in-flight conversation
-    by one turn. Translates outgoing messages, persists state, and returns a
-    fallback message on server-side failure.
+    Loads the session's current conversation and advances it by one turn. If that
+    conversation has already ended (stage=DONE) it is final -- we return 409 so the
+    frontend starts a fresh chat (POST /chat); there is no rollover and no memory
+    carry-over. Translates outgoing messages, persists state, and returns a fallback
+    message on server-side failure.
     """
     _ensure_state()
     conn = get_conn()
@@ -955,59 +986,27 @@ def continue_chat(request: ContinueChatRequest):
         stage = conversation.get("stage", DONE)
         vars = conversation.get("vars", {})
 
+        # Ended conversations are final -- no rollover, no memory carry-over. The
+        # frontend should start a new chat (POST /chat) instead of continuing.
         if stage == DONE:
-            # --- ROLLOVER: cumulative summary -> new seeded conversation ---
-            prior_summary = vars.get("carried_summary", "")
-            summary = summarize_conversation(conv_id, vars, prior_summary=prior_summary)
+            raise HTTPException(
+                status_code=409,
+                detail="This conversation has ended. Please start a new chat.",
+            )
 
-            conversation["summary"] = summary
-            conversation["rolled_over"] = True
-            upsert_conversation(conn, conversation)
-
-            new_conv = create_conversation(seed_summary=summary)
-            new_vars = {"carried_summary": summary} if summary else {}
-            messages, new_stage, new_vars = step(
-                new_conv.id, request.message, None, new_vars
-            )
-            messages = translate_messages(messages, new_vars.get("lang"))
-            answer = "\n\n".join(m for m in messages if m)
-
-            save_conversation(
-                conn,
-                request.user_id,
-                new_conv.id,
-                stage=new_stage,
-                vars=new_vars,
-                question=request.message,
-                answer=answer,
-                session_id=session_id,
-                seq=conversation.get("seq", 0) + 1,
-                previous_conversation_id=conv_id,
-            )
-            save_session(
-                conn,
-                request.user_id,
-                session_id,
-                new_conv.id,
-                session.get("title"),
-            )
-            conv_id = new_conv.id
-        else:
-            # --- normal in-flow turn ---
-            messages, new_stage, new_vars = step(
-                conv_id, request.message, stage, vars
-            )
-            messages = translate_messages(messages, new_vars.get("lang"))
-            answer = "\n\n".join(m for m in messages if m)
-            save_conversation(
-                conn,
-                request.user_id,
-                conv_id,
-                stage=new_stage,
-                vars=new_vars,
-                question=request.message,
-                answer=answer,
-            )
+        # normal in-flow turn (active conversation)
+        messages, new_stage, new_vars = step(conv_id, request.message, stage, vars)
+        messages = translate_messages(messages, new_vars.get("lang"))
+        answer = "\n\n".join(m for m in messages if m)
+        save_conversation(
+            conn,
+            request.user_id,
+            conv_id,
+            stage=new_stage,
+            vars=new_vars,
+            question=request.message,
+            answer=answer,
+        )
 
         return {
             "user_id": request.user_id,
@@ -1043,18 +1042,26 @@ def get_sessions(user_id: str):
     conn = get_conn()
     try:
         cur = conn.cursor()
+        # Exclude sessions whose current conversation has ended (stage = DONE), so
+        # ended chats drop off the left panel.
         if SQLITE_DB_PATH:
             cur.execute(
-                "SELECT id, session_id, current_conversation_id, title, "
-                "created_at, updated_at FROM sessions WHERE user_id = ? "
-                "ORDER BY updated_at DESC LIMIT 20",
+                "SELECT s.id, s.session_id, s.current_conversation_id, s.title, "
+                "s.created_at, s.updated_at FROM sessions s "
+                "LEFT JOIN conversations c "
+                "  ON c.user_id = s.user_id AND c.id = s.current_conversation_id "
+                "WHERE s.user_id = ? AND (c.stage IS NULL OR c.stage <> 'DONE') "
+                "ORDER BY s.updated_at DESC LIMIT 20",
                 (user_id,),
             )
         else:
             cur.execute(
-                "SELECT TOP 20 id, session_id, current_conversation_id, title, "
-                "created_at, updated_at FROM sessions WHERE user_id = ? "
-                "ORDER BY updated_at DESC",
+                "SELECT TOP 20 s.id, s.session_id, s.current_conversation_id, s.title, "
+                "s.created_at, s.updated_at FROM sessions s "
+                "LEFT JOIN conversations c "
+                "  ON c.user_id = s.user_id AND c.id = s.current_conversation_id "
+                "WHERE s.user_id = ? AND (c.stage IS NULL OR c.stage <> 'DONE') "
+                "ORDER BY s.updated_at DESC",
                 (user_id,),
             )
         rows = _fetchall_dicts(cur)
@@ -1080,8 +1087,6 @@ def _conversation_messages(openai_client, conversation_id: str) -> list:
             if getattr(part, "text", None):
                 text = part.text
                 break
-        if text.startswith(CONTEXT_MARKER):
-            continue  # hide seeded prior-session context
         result.append({"role": str(item.role), "content": text})
     return result
 
@@ -1103,22 +1108,25 @@ def get_conversation(user_id: str, session_id: Optional[str] = None):
             "title, created_at, updated_at"
         )
         # Step 1: get the conversation rows (conv_ids) from SQL
+        # Exclude ended (DONE) conversations so they drop out of history.
         if session_id:
             cur.execute(
                 f"SELECT {cols} FROM conversations WHERE user_id = ? AND session_id = ? "
-                "ORDER BY seq ASC",
+                "AND (stage IS NULL OR stage <> 'DONE') ORDER BY seq ASC",
                 (user_id, session_id),
             )
         elif SQLITE_DB_PATH:
             cur.execute(
                 f"SELECT {cols} FROM conversations WHERE user_id = ? "
+                "AND (stage IS NULL OR stage <> 'DONE') "
                 "ORDER BY created_at DESC LIMIT 10",
                 (user_id,),
             )
         else:
             cur.execute(
                 f"SELECT TOP 10 {cols} FROM conversations "
-                "WHERE user_id = ? ORDER BY created_at DESC",
+                "WHERE user_id = ? AND (stage IS NULL OR stage <> 'DONE') "
+                "ORDER BY created_at DESC",
                 (user_id,),
             )
         rows = _fetchall_dicts(cur)
