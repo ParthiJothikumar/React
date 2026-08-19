@@ -1,5 +1,5 @@
-TENANT_ID = "629ea051-68ee-43a9-8e6f-3352c151e085"
-CLIENT_ID = "b6ce651e-b66f-45e0-b13c-742f4fc69247"
-CLIENT_SECRET = "qfw8Q~b9q2gTqE9NYACjIplGLiC76ZuRmK.YUakS"
-
-"https://aifoundry-rjteh-ais-swce-poc.services.ai.azure.com/api/projects/aifp-uqqnf-ais-swce-poc"
+DIAGNOSTICS_START_URL = "http://localhost:8001/start"
+DIAGNOSTICS_STATUS_URL = "http://localhost:8001/status"
+TROUBLESHOOT_START_URL = "http://localhost:8001/start"
+TROUBLESHOOT_STATUS_URL = "http://localhost:8001/status"
+DEFAULT_DEVICE_ID = "d57cc3db-d2ad-42c3-a855-476359ac0aac"
