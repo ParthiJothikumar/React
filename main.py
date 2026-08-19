@@ -54,6 +54,13 @@ class Config:
     # Local testing without Azure. OFF unless explicitly enabled -- a service that
     # silently pretends to repair machines is worse than one that plainly fails.
     mock: bool
+    # Skip the Foundry KB->script lookup and always use this script id. For testing the
+    # Intune half (trigger + run-state) against a known device without needing the agent
+    # or a populated KB. The remediation itself is REAL -- only the mapping is bypassed.
+    static_script_id: str
+    # Used only to fill in a missing device_id on /status, so the endpoint can be called
+    # in Postman with no arguments at all. /start still demands an explicit one.
+    default_device_id: str
 
     @property
     def graph_ready(self) -> bool:
@@ -69,7 +76,14 @@ def load_config() -> Config:
         client_id=os.getenv("AZURE_CLIENT_ID", ""),
         client_secret=os.getenv("AZURE_CLIENT_SECRET", ""),
         mock=os.getenv("DIAGNOSTICS_MOCK", "false").strip().lower() == "true",
+        static_script_id=os.getenv("STATIC_SCRIPT_ID", "").strip(),
+        default_device_id=os.getenv("DEFAULT_DEVICE_ID", "").strip(),
     )
+    if cfg.static_script_id:
+        logger.warning(
+            "STATIC_SCRIPT_ID is set (%s) -- the KB is IGNORED and every /start triggers "
+            "this one script. Testing shortcut only.", cfg.static_script_id,
+        )
     if cfg.mock:
         logger.warning(
             "DIAGNOSTICS_MOCK is ON -- no agent call, no Intune trigger, fabricated "
@@ -337,6 +351,8 @@ def health():
         "mock": config.mock,
         "foundry_configured": bool(config.foundry_endpoint),
         "graph_configured": config.graph_ready,
+        "static_script_id": config.static_script_id or None,
+        "default_device_id": config.default_device_id or None,
     }
 
 
@@ -378,9 +394,13 @@ def start(request: StartRequest):
         logger.warning("MOCK: no agent call, no Intune trigger -> %s", job_id)
         return StartResponse(job_id=job_id, correlation_id=correlation_id)
 
-    mapping = agent_service.map_kb_to_script(device_id, kb_id)
-    script_id = (mapping.get("script_id") or "UNKNOWN").strip()
-    logger.info("Agent mapping: %s", mapping)
+    if config.static_script_id:
+        script_id = config.static_script_id
+        logger.warning("STATIC_SCRIPT_ID: skipping the agent, using %s", script_id)
+    else:
+        mapping = agent_service.map_kb_to_script(device_id, kb_id)
+        script_id = (mapping.get("script_id") or "UNKNOWN").strip()
+        logger.info("Agent mapping: %s", mapping)
 
     if script_id in ("", "UNKNOWN"):
         raise HTTPException(
@@ -393,19 +413,44 @@ def start(request: StartRequest):
 
 
 @app.get("/status")
-def status(job_id: str):
-    """Raw Intune run-state for a job_id produced by /start.
+def status(
+    job_id: Optional[str] = None,
+    script_id: Optional[str] = None,
+    device_id: Optional[str] = None,
+):
+    """Raw Intune run-state for a job. Two equivalent ways to identify it:
+
+        ?job_id=<script_id>:<device_id>     <- what the ORCHESTRATOR sends
+        ?script_id=...&device_id=...        <- convenient in Postman / curl
+
+    Both end up calling the same Graph query, because the deviceRunStates record id IS
+    the "<script_id>:<device_id>" pair. The split form exists so a run can be checked
+    with values pasted from the Intune portal, without first calling /start -- useful
+    when the trigger happened minutes ago and the job_id is no longer to hand.
+
+    device_id falls back to DEFAULT_DEVICE_ID when set, so /status?script_id=... alone
+    works while testing against one machine.
 
     Deliberately NOT normalised -- the orchestrator's _derive_intune reads
     detectionState / remediationState / lastStateUpdateDateTime and the script outputs,
     and uses lastStateUpdateDateTime to tell a fresh result from a stale one.
     """
-    if ":" not in job_id:
-        raise HTTPException(
-            status_code=400,
-            detail="job_id must be '<script_id>:<device_id>'",
-        )
-    script_id, device_id = job_id.split(":", 1)
+    if job_id:
+        if ":" not in job_id:
+            raise HTTPException(
+                status_code=400,
+                detail="job_id must be '<script_id>:<device_id>'",
+            )
+        script_id, device_id = job_id.split(":", 1)
+    else:
+        script_id = (script_id or config.static_script_id or "").strip()
+        device_id = (device_id or config.default_device_id or "").strip()
+        if not script_id or not device_id:
+            raise HTTPException(
+                status_code=400,
+                detail="pass either ?job_id=<script_id>:<device_id> or both "
+                       "?script_id= and ?device_id=",
+            )
 
     if config.mock:
         # Fabricated success, obviously labelled so it can never be mistaken for real
