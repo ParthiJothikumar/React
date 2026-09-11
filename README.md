@@ -1,1 +1,5 @@
-python -u -c "print('python is running'); import time; t=time.time(); import app.main; print('imports:', round(time.time()-t,2), 's')"
+python -u -c "import time; t=time.time(); import app.core.config; print('config', round(time.time()-t,2))"
+python -u -c "import time; t=time.time(); import fastapi; print('fastapi', round(time.time()-t,2))"
+python -u -c "import time; t=time.time(); import app.db.database; print('database mod', round(time.time()-t,2))"
+python -u -c "import time; t=time.time(); import mssql_python; print('mssql driver', round(time.time()-t,2))"
+python -u -c "import time; t=time.time(); import app.deps; print('deps', round(time.time()-t,2))"
